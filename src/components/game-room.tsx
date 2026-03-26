@@ -550,7 +550,8 @@ export default function GameRoom({ gameId }: { gameId: string }) {
     return styles;
   }, [allowedSquares, legalTargetsFromSelected, selectedSquare]);
 
-  const boardOrientation = myPlayer?.color === "b" ? "black" : "white";
+  const boardOrientation: "white" | "black" =
+    myPlayer?.color === "b" ? "black" : "white";
 
   const chessboardOptions = useMemo(
     () => ({
