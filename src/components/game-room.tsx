@@ -253,16 +253,18 @@ export default function GameRoom({ gameId }: { gameId: string }) {
       return;
     }
 
+    const allowedPieceType = game.allowed_piece_type;
+
     const revealKey = [
       game.id,
       game.move_count,
       game.current_turn,
-      game.allowed_piece_type,
+      allowedPieceType,
       game.fen,
     ].join("|");
 
     if (lastRevealKeyRef.current === revealKey) {
-      setDisplayedPieceType(game.allowed_piece_type);
+      setDisplayedPieceType(allowedPieceType);
       setIsRolling(false);
       return;
     }
@@ -272,16 +274,16 @@ export default function GameRoom({ gameId }: { gameId: string }) {
     const legalTypes = getLegalPieceTypes(new Chess(game.fen));
 
     if (legalTypes.length <= 1) {
-      setDisplayedPieceType(game.allowed_piece_type);
+      setDisplayedPieceType(allowedPieceType);
       setIsRolling(false);
       setRollStrip([]);
-      setMessage(`${PIECE_LABELS[game.allowed_piece_type]} geldi.`);
+      setMessage(`${PIECE_LABELS[allowedPieceType]} geldi.`);
       return;
     }
 
     const { strip, targetIndex } = buildDeterministicRollStrip({
       legalTypes,
-      finalType: game.allowed_piece_type,
+      finalType: allowedPieceType,
       seedSource: revealKey,
       stripLength: 30,
       targetIndex: 23,
@@ -294,9 +296,9 @@ export default function GameRoom({ gameId }: { gameId: string }) {
     setIsRolling(true);
 
     rollSettleTimeoutRef.current = setTimeout(() => {
-      setDisplayedPieceType(game.allowed_piece_type);
+      setDisplayedPieceType(allowedPieceType);
       setIsRolling(false);
-      setMessage(`${PIECE_LABELS[game.allowed_piece_type]} geldi.`);
+      setMessage(`${PIECE_LABELS[allowedPieceType]} geldi.`);
     }, 3000);
 
     return () => {
