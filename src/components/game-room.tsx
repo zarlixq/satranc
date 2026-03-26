@@ -9,7 +9,7 @@ import {
   type CSSProperties,
 } from "react";
 import { useRouter } from "next/navigation";
-import { Chessboard } from "react-chessboard";
+import { Chessboard, type ChessboardOptions } from "react-chessboard";
 import { Chess, Square } from "chess.js";
 import { motion } from "framer-motion";
 import {
@@ -431,8 +431,10 @@ export default function GameRoom({ gameId }: { gameId: string }) {
     [canInteract, commitMove, game, optimisticFen]
   );
 
-  const handleSquareClick = useCallback(
-    ({ square }: { square: string; piece?: string }) => {
+  const handleSquareClick = useCallback<
+    NonNullable<ChessboardOptions["onSquareClick"]>
+  >(
+    ({ square }) => {
       if (!canInteract) return;
 
       const clickedSquare = square as Square;
@@ -458,15 +460,10 @@ export default function GameRoom({ gameId }: { gameId: string }) {
     ]
   );
 
-  const handlePieceDrop = useCallback(
-    ({
-      sourceSquare,
-      targetSquare,
-    }: {
-      piece: string;
-      sourceSquare: string;
-      targetSquare: string | null;
-    }) => {
+  const handlePieceDrop = useCallback<
+    NonNullable<ChessboardOptions["onPieceDrop"]>
+  >(
+    ({ sourceSquare, targetSquare }) => {
       if (!targetSquare || !canInteract) return false;
 
       if (!allowedSquares.includes(sourceSquare as Square)) {
@@ -553,7 +550,7 @@ export default function GameRoom({ gameId }: { gameId: string }) {
   const boardOrientation: "white" | "black" =
     myPlayer?.color === "b" ? "black" : "white";
 
-  const chessboardOptions = useMemo(
+  const chessboardOptions = useMemo<ChessboardOptions>(
     () => ({
       position: boardFen,
       boardOrientation,
