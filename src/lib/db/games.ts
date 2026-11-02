@@ -27,6 +27,32 @@ export class DbError extends Error {
   }
 }
 
+/** Satır yok ya da RLS gizliyor: oyuncusu olunmayan oyun "yok" görünür. */
+export class GameNotFoundError extends DbError {
+  constructor() {
+    super("Oyun bulunamadı.");
+    this.name = "GameNotFoundError";
+  }
+}
+
+const NETWORK_ERROR_MESSAGE = "Bağlantı yok. İnternetini kontrol edip tekrar dene.";
+const RETRY_DELAYS_MS = [800, 2000];
+
+function wait(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Postgres'ten gelen hatalarda kod olur; ağ hatalarında olmaz. */
+function isNetworkError(error: { code?: string }) {
+  return !error.code;
+}
+
+function toDbError(error: { message: string; code?: string }) {
+  return isNetworkError(error)
+    ? new DbError(NETWORK_ERROR_MESSAGE)
+    : new DbError(error.message, error.code);
+}
+
 type RpcName = keyof Database["public"]["Functions"];
 type RpcArgs<N extends RpcName> = Database["public"]["Functions"][N]["Args"];
 type RpcReturns<N extends RpcName> = Database["public"]["Functions"][N]["Returns"];
@@ -35,13 +61,26 @@ async function callRpc<N extends RpcName>(
   name: N,
   args: RpcArgs<N>
 ): Promise<RpcReturns<N>> {
-  const { data, error } = await supabase.rpc(name, args as never);
+  // Yazmalar sunucuda tekrarlanabilir olduğu için ağ kopmasında yeniden denemek
+  // güvenlidir: yanıtı kaybolan istek ikinci kez yazılmaz.
+  for (let attempt = 0; ; attempt += 1) {
+    const { data, error } = await supabase.rpc(name, args as never);
 
-  if (error) {
-    throw new DbError(error.message, error.code);
+    if (!error) {
+      return data as unknown as RpcReturns<N>;
+    }
+
+    const canRetry =
+      isNetworkError(error) &&
+      attempt < RETRY_DELAYS_MS.length &&
+      navigator.onLine !== false;
+
+    if (!canRetry) {
+      throw toDbError(error);
+    }
+
+    await wait(RETRY_DELAYS_MS[attempt]);
   }
-
-  return data as unknown as RpcReturns<N>;
 }
 
 export function createGame(lobbyCode: string): Promise<CreateGameResult> {
@@ -64,12 +103,11 @@ export async function getGame(gameId: string): Promise<DbGame> {
     .maybeSingle();
 
   if (error) {
-    throw new DbError(error.message, error.code);
+    throw toDbError(error);
   }
 
-  // RLS, oyuncusu olunmayan oyunu "yok" gibi gösterir.
   if (!data) {
-    throw new DbError("Oyun bulunamadı.");
+    throw new GameNotFoundError();
   }
 
   return data;
@@ -83,7 +121,7 @@ export async function getGamePlayers(gameId: string): Promise<DbGamePlayer[]> {
     .order("created_at", { ascending: true });
 
   if (error) {
-    throw new DbError(error.message, error.code);
+    throw toDbError(error);
   }
 
   return data ?? [];
@@ -101,7 +139,7 @@ export async function getPlayerForGame(
     .maybeSingle();
 
   if (error) {
-    throw new DbError(error.message, error.code);
+    throw toDbError(error);
   }
 
   return data;
@@ -161,6 +199,21 @@ export function finishGame(
   });
 }
 
+/** Hamlelerden sonra oluşan pozisyonlar, sırayla (üçlü tekrar için). */
+export async function getGameFens(gameId: string): Promise<string[]> {
+  const { data, error } = await supabase
+    .from("game_moves")
+    .select("fen_after")
+    .eq("game_id", gameId)
+    .order("move_number", { ascending: true });
+
+  if (error) {
+    throw toDbError(error);
+  }
+
+  return (data ?? []).map((row) => row.fen_after);
+}
+
 /** Replay için: hamleler move_number sırasıyla. */
 export async function getGameMoves(gameId: string): Promise<DbGameMove[]> {
   const { data, error } = await supabase
@@ -170,7 +223,7 @@ export async function getGameMoves(gameId: string): Promise<DbGameMove[]> {
     .order("move_number", { ascending: true });
 
   if (error) {
-    throw new DbError(error.message, error.code);
+    throw toDbError(error);
   }
 
   return data ?? [];
@@ -187,7 +240,7 @@ export async function getGameDiceRolls(
     .order("move_number", { ascending: true });
 
   if (error) {
-    throw new DbError(error.message, error.code);
+    throw toDbError(error);
   }
 
   return data ?? [];

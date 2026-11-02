@@ -16,13 +16,21 @@ import {
   buildDeterministicRollStrip,
   getAllowedSquares,
   getLegalPieceTypes,
+  moveNeedsPromotion,
   PIECE_LABELS,
   PieceType,
+  PromotionChoice,
 } from "@/lib/chaos-chess";
+import { pickNewerGame } from "@/lib/game-sync";
+import {
+  connectGameChannel,
+  type ConnectionStatus,
+} from "@/lib/realtime/game-channel";
 import {
   DbGame,
   DbGamePlayer,
   ensureSession,
+  GameNotFoundError,
   getGame,
   getGamePlayers,
   getMyPlayerForGame,
@@ -30,38 +38,62 @@ import {
   resignGame,
   rollForCurrentTurn,
   simulateMoveLocally,
-  subscribeToFastGame,
 } from "@/lib/supabase/game-service";
 
-function getStatusText(game: DbGame) {
+const ROLL_DURATION_MS = 3000;
+const STRIP_ITEM_WIDTH = 72;
+const STRIP_VIEW_WIDTH = 216;
+/** Soket sessizce ölmüş olabilir: bağlıyken bile aralıklarla DB'den okunur. */
+const SAFETY_POLL_MS = 10000;
+const DISCONNECTED_POLL_MS = 3000;
+/** Kısa kopmalar (uygulama değiştirme, ağ geçişi) "çevrimdışı" sayılmaz. */
+const OPPONENT_OFFLINE_GRACE_MS = 8000;
+const RESIGN_CONFIRM_MS = 4000;
+
+const PROMOTION_CHOICES: PromotionChoice[] = ["q", "r", "b", "n"];
+
+function colorName(color: "w" | "b") {
+  return color === "w" ? "Beyaz" : "Siyah";
+}
+
+function getStatusText(game: DbGame, myColor: "w" | "b" | null) {
   if (game.status === "waiting") return "Rakip bekleniyor";
   if (game.status === "finished") return "Oyun bitti";
   if (game.status === "cancelled") return "İptal edildi";
 
-  const chess = new Chess(game.fen);
+  const inCheck = new Chess(game.fen).isCheck();
 
-  if (chess.isCheckmate()) return "Şah mat";
-  if (chess.isStalemate()) return "Pat";
-  if (chess.isDraw()) return "Berabere";
-  if (chess.isCheck()) {
-    return `${game.current_turn === "w" ? "Beyaz" : "Siyah"} şah altında`;
+  if (game.current_turn === myColor) {
+    return inCheck ? "Sıra sende, şah altındasın" : "Sıra sende";
   }
 
-  return `${game.current_turn === "w" ? "Beyaz" : "Siyah"} oynuyor`;
+  return inCheck
+    ? `${colorName(game.current_turn)} şah altında`
+    : `${colorName(game.current_turn)} oynuyor`;
 }
 
-function getResultText(game: DbGame) {
-  if (game.status !== "finished") return null;
+function getResultTitle(game: DbGame, myUserId: string | null) {
+  if (!game.winner_user_id) {
+    return game.result_reason === "checkmate" || game.result_reason === "resign"
+      ? "Oyun bitti"
+      : "Berabere";
+  }
+
+  return game.winner_user_id === myUserId ? "Kazandın" : "Kaybettin";
+}
+
+function getResultText(game: DbGame, myUserId: string | null) {
+  const iWon = !!myUserId && game.winner_user_id === myUserId;
 
   switch (game.result_reason) {
     case "checkmate":
-      return "Oyun şah mat ile bitti.";
+      return iWon ? "Rakibini mat ettin." : "Mat oldun.";
     case "stalemate":
       return "Oyun pat ile bitti.";
     case "draw":
       return "Oyun berabere bitti.";
     case "resign":
-      return "Rakip pes etti.";
+      return iWon ? "Rakibin pes etti." : "Pes ettin.";
     case "timeout":
       return "Süre dolduğu için oyun bitti.";
     case "abandon":
@@ -69,6 +101,23 @@ function getResultText(game: DbGame) {
     default:
       return "Oyun sona erdi.";
   }
+}
+
+async function copyText(text: string) {
+  if (navigator.clipboard) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  // HTTP üzerinden açılan sayfalarda (ör. yerel ağ) clipboard API yoktur.
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
 }
 
 export default function GameRoom({ gameId }: { gameId: string }) {
@@ -79,206 +128,237 @@ export default function GameRoom({ gameId }: { gameId: string }) {
   const [myPlayer, setMyPlayer] = useState<DbGamePlayer | null>(null);
 
   const [loading, setLoading] = useState(true);
+  const [gone, setGone] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
   const [selectedSquare, setSelectedSquare] = useState<Square | null>(null);
-  const [message, setMessage] = useState("");
+  const [pendingPromotion, setPendingPromotion] = useState<{
+    from: Square;
+    to: Square;
+  } | null>(null);
   const [error, setError] = useState("");
-  const [copySuccess, setCopySuccess] = useState(false);
-  const [realtimeConnected, setRealtimeConnected] = useState(true);
-
+  const [notice, setNotice] = useState("");
   const [optimisticFen, setOptimisticFen] = useState<string | null>(null);
+  const [confirmingResign, setConfirmingResign] = useState(false);
+  const [endDismissed, setEndDismissed] = useState(false);
 
-  const [displayedPieceType, setDisplayedPieceType] = useState<PieceType | null>(
-    null
-  );
-  const [isRolling, setIsRolling] = useState(false);
-  const [rollStrip, setRollStrip] = useState<PieceType[]>([]);
-  const [rollTargetIndex, setRollTargetIndex] = useState(0);
-  const [rollAnimKey, setRollAnimKey] = useState(0);
+  const [connection, setConnection] = useState<ConnectionStatus>("connecting");
+  const [presentUserIds, setPresentUserIds] = useState<string[] | null>(null);
+  const [opponentOffline, setOpponentOffline] = useState(false);
 
-  const rollSettleTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastRevealKeyRef = useRef("");
+  const [revealedKey, setRevealedKey] = useState<string | null>(null);
+  const [rollAnim, setRollAnim] = useState<{
+    key: string;
+    strip: PieceType[];
+    targetIndex: number;
+  } | null>(null);
 
-  const boardAreaRef = useRef<HTMLDivElement | null>(null);
-  const [boardSize, setBoardSize] = useState(720);
+  const gameRef = useRef<DbGame | null>(null);
+  const playerCountRef = useRef(0);
+  const inFlightRef = useRef(false);
+  const refreshRef = useRef<Promise<void> | null>(null);
+  const initialRevealDoneRef = useRef(false);
+  const channelRef = useRef<ReturnType<typeof connectGameChannel> | null>(null);
 
-  const loadAll = useCallback(async () => {
-    try {
-      setError("");
+  const applyGame = useCallback((next: DbGame) => {
+    const prev = gameRef.current;
+    const merged = pickNewerGame(prev, next);
+    if (merged === prev) return;
 
-      await ensureSession();
+    gameRef.current = merged;
+    setGame(merged);
+    setError("");
+    setSelectedSquare(null);
+    setPendingPromotion(null);
+    if (!inFlightRef.current) setOptimisticFen(null);
+  }, []);
 
-      const [gameData, playersData, myData] = await Promise.all([
-        getGame(gameId),
-        getGamePlayers(gameId),
-        getMyPlayerForGame(gameId),
-      ]);
+  const refresh = useCallback(() => {
+    if (refreshRef.current) return refreshRef.current;
 
-      setGame(gameData);
-      setPlayers(playersData);
-      setMyPlayer(myData);
-
-      if (gameData.status === "waiting") {
-        setMessage("Rakip lobiye girene kadar bekleniyor.");
-      } else if (gameData.status === "finished") {
-        setMessage(getResultText(gameData) ?? "Oyun bitti.");
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Oyun yüklenemedi.";
-      setError(msg);
-    } finally {
-      setLoading(false);
-    }
-  }, [gameId]);
-
-  useEffect(() => {
-    void loadAll();
-  }, [loadAll]);
-
-  useEffect(() => {
-    let unsubscribe: (() => void) | undefined;
-    let pollInterval: ReturnType<typeof setInterval> | undefined;
-    let cancelled = false;
-
-    const bootFast = async () => {
+    const run = async () => {
       try {
-        unsubscribe = await subscribeToFastGame(gameId, (payload) => {
-          if (payload.type !== "state_sync") return;
-          if (payload.game.id !== gameId) return;
+        await ensureSession();
 
-          setGame((prev) => {
-            if (!prev) return payload.game;
+        const [gameData, playersData, myData] = await Promise.all([
+          getGame(gameId),
+          getGamePlayers(gameId),
+          getMyPlayerForGame(gameId),
+        ]);
 
-            const sameOrNewer =
-              payload.game.move_count >= prev.move_count ||
-              payload.game.status !== prev.status ||
-              payload.game.allowed_piece_type !== prev.allowed_piece_type ||
-              payload.game.fen !== prev.fen;
-
-            return sameOrNewer ? payload.game : prev;
-          });
-
-          setOptimisticFen(null);
-          setSelectedSquare(null);
-
-          if (payload.game.status !== "waiting") {
-            void loadAll();
-          }
-        });
-
-        if (cancelled) {
-          unsubscribe?.();
-          return;
-        }
-
-        setRealtimeConnected(true);
+        applyGame(gameData);
+        playerCountRef.current = playersData.length;
+        setPlayers(playersData);
+        setMyPlayer(myData);
+        setGone(false);
+        if (!inFlightRef.current) setOptimisticFen(null);
       } catch (e) {
-        console.error("[Realtime]", e);
-
-        if (cancelled) return;
-
-        setRealtimeConnected(false);
-        setMessage("Realtime bağlanamadı. Oyun kısa aralıklarla yenileniyor.");
-
-        pollInterval = setInterval(() => {
-          void loadAll();
-        }, 2500);
+        if (e instanceof GameNotFoundError) {
+          setGone(true);
+        } else if (!gameRef.current) {
+          setError(e instanceof Error ? e.message : "Oyun yüklenemedi.");
+        }
+        // Oyun yüklüyken geçici ağ hatası sessiz geçilir, sonraki okuma düzeltir.
+      } finally {
+        setLoading(false);
+        refreshRef.current = null;
       }
     };
 
-    void bootFast();
+    refreshRef.current = run();
+    return refreshRef.current;
+  }, [applyGame, gameId]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  // Canlı kanal: oturum hazır olduktan sonra açılır ki RLS doğru kullanıcıyla çalışsın.
+  useEffect(() => {
+    let cancelled = false;
+
+    const boot = async () => {
+      let userId: string;
+      try {
+        userId = await ensureSession();
+      } catch {
+        return;
+      }
+      if (cancelled) return;
+
+      channelRef.current = connectGameChannel(gameId, userId, {
+        onGame: (next) => {
+          applyGame(next);
+          if (next.status !== "waiting" && playerCountRef.current < 2) {
+            void refresh();
+          }
+        },
+        onStatus: setConnection,
+        onResync: () => void refresh(),
+        onPresence: setPresentUserIds,
+      });
+    };
+
+    void boot();
 
     return () => {
       cancelled = true;
-      unsubscribe?.();
-      if (pollInterval) clearInterval(pollInterval);
+      channelRef.current?.disconnect();
+      channelRef.current = null;
     };
-  }, [gameId, loadAll]);
+  }, [applyGame, gameId, refresh]);
 
+  // Telefon: arka plana atılma, ekran kilidi, ağ değişimi, geri tuşu önbelleği.
   useEffect(() => {
-    const element = boardAreaRef.current;
-    if (!element) return;
-
-    const updateSize = () => {
-      const rect = element.getBoundingClientRect();
-      const next = Math.max(
-        320,
-        Math.floor(Math.min(rect.width, rect.height) - 8)
-      );
-      setBoardSize(next);
+    const resync = () => {
+      channelRef.current?.ensureConnected();
+      void refresh();
     };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") resync();
+    };
+    const onOnline = () => {
+      channelRef.current?.reconnectNow();
+      void refresh();
+    };
+    const onOffline = () => channelRef.current?.markOffline();
 
-    updateSize();
-
-    const observer = new ResizeObserver(() => {
-      updateSize();
-    });
-
-    observer.observe(element);
-    window.addEventListener("resize", updateSize);
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("focus", resync);
+    window.addEventListener("pageshow", resync);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
 
     return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", updateSize);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", resync);
+      window.removeEventListener("pageshow", resync);
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
     };
-  }, []);
+  }, [refresh]);
 
   useEffect(() => {
-    if (!copySuccess) return;
+    const delay =
+      connection === "connected" ? SAFETY_POLL_MS : DISCONNECTED_POLL_MS;
 
-    const timeout = setTimeout(() => {
-      setCopySuccess(false);
-    }, 1800);
+    const interval = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      channelRef.current?.ensureConnected();
+      void refresh();
+    }, delay);
 
+    return () => clearInterval(interval);
+  }, [connection, refresh]);
+
+  const opponentPlayer = useMemo(() => {
+    if (!myPlayer) return null;
+    return players.find((p) => p.color !== myPlayer.color) ?? null;
+  }, [players, myPlayer]);
+
+  // Kendi bağlantımız yokken rakibin durumu bilinemez, gösterge yanıltmasın.
+  const opponentMissing =
+    connection === "connected" &&
+    game?.status === "active" &&
+    !!opponentPlayer?.user_id &&
+    presentUserIds !== null &&
+    !presentUserIds.includes(opponentPlayer.user_id);
+
+  useEffect(() => {
+    if (!opponentMissing) {
+      const clear = setTimeout(() => setOpponentOffline(false), 0);
+      return () => clearTimeout(clear);
+    }
+
+    const timer = setTimeout(
+      () => setOpponentOffline(true),
+      OPPONENT_OFFLINE_GRACE_MS
+    );
+    return () => clearTimeout(timer);
+  }, [opponentMissing]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timeout = setTimeout(() => setNotice(""), 2000);
     return () => clearTimeout(timeout);
-  }, [copySuccess]);
+  }, [notice]);
 
   useEffect(() => {
-    if (rollSettleTimeoutRef.current) {
-      clearTimeout(rollSettleTimeoutRef.current);
-      rollSettleTimeoutRef.current = null;
+    if (!confirmingResign) return;
+    const timeout = setTimeout(
+      () => setConfirmingResign(false),
+      RESIGN_CONFIRM_MS
+    );
+    return () => clearTimeout(timeout);
+  }, [confirmingResign]);
+
+  const hasGame = !!game;
+  const fen = game?.fen ?? null;
+  const allowedPieceType =
+    game?.status === "active" ? game.allowed_piece_type : null;
+
+  const revealKey =
+    game && allowedPieceType
+      ? [game.id, game.move_count, game.current_turn, allowedPieceType, fen].join("|")
+      : null;
+
+  // Zar animasyonu yalnızca canlı gelen sonuçta oynar. Sayfa yenilenince sonuç
+  // beklemeden görünür, tahta da kilitli kalmaz.
+  useEffect(() => {
+    if (!hasGame) return;
+
+    if (!initialRevealDoneRef.current) {
+      initialRevealDoneRef.current = true;
+      const settle = setTimeout(() => setRevealedKey(revealKey), 0);
+      return () => clearTimeout(settle);
     }
 
-    if (!game) {
-      setDisplayedPieceType(null);
-      setIsRolling(false);
-      setRollStrip([]);
-      return;
-    }
+    if (!revealKey || !allowedPieceType || !fen) return;
 
-    if (game.status !== "active" || !game.allowed_piece_type) {
-      setDisplayedPieceType(null);
-      setIsRolling(false);
-      setRollStrip([]);
-      return;
-    }
-
-    const allowedPieceType = game.allowed_piece_type;
-
-    const revealKey = [
-      game.id,
-      game.move_count,
-      game.current_turn,
-      allowedPieceType,
-      game.fen,
-    ].join("|");
-
-    if (lastRevealKeyRef.current === revealKey) {
-      setDisplayedPieceType(allowedPieceType);
-      setIsRolling(false);
-      return;
-    }
-
-    lastRevealKeyRef.current = revealKey;
-
-    const legalTypes = getLegalPieceTypes(new Chess(game.fen));
+    const legalTypes = getLegalPieceTypes(new Chess(fen));
 
     if (legalTypes.length <= 1) {
-      setDisplayedPieceType(allowedPieceType);
-      setIsRolling(false);
-      setRollStrip([]);
-      setMessage(`${PIECE_LABELS[allowedPieceType]} geldi.`);
-      return;
+      const settle = setTimeout(() => setRevealedKey(revealKey), 0);
+      return () => clearTimeout(settle);
     }
 
     const { strip, targetIndex } = buildDeterministicRollStrip({
@@ -289,46 +369,38 @@ export default function GameRoom({ gameId }: { gameId: string }) {
       targetIndex: 23,
     });
 
-    setRollStrip(strip);
-    setRollTargetIndex(targetIndex);
-    setRollAnimKey((prev) => prev + 1);
-    setDisplayedPieceType(null);
-    setIsRolling(true);
-
-    rollSettleTimeoutRef.current = setTimeout(() => {
-      setDisplayedPieceType(allowedPieceType);
-      setIsRolling(false);
-      setMessage(`${PIECE_LABELS[allowedPieceType]} geldi.`);
-    }, 3000);
+    const start = setTimeout(
+      () => setRollAnim({ key: revealKey, strip, targetIndex }),
+      0
+    );
+    const settle = setTimeout(() => setRevealedKey(revealKey), ROLL_DURATION_MS);
 
     return () => {
-      if (rollSettleTimeoutRef.current) {
-        clearTimeout(rollSettleTimeoutRef.current);
-        rollSettleTimeoutRef.current = null;
-      }
+      clearTimeout(start);
+      clearTimeout(settle);
     };
-  }, [game]);
+  }, [allowedPieceType, fen, hasGame, revealKey]);
 
-  const officialChess = useMemo(() => {
-    if (!game) return null;
-    return new Chess(game.fen);
-  }, [game]);
+  const isRolling = !!revealKey && revealedKey !== revealKey;
+  const displayedPieceType = isRolling ? null : allowedPieceType;
 
-  const boardFen = optimisticFen ?? game?.fen ?? "start";
+  const officialChess = useMemo(() => (fen ? new Chess(fen) : null), [fen]);
+
+  const boardFen = optimisticFen ?? fen ?? "start";
 
   const allowedSquares = useMemo(() => {
-    if (!officialChess || !game?.allowed_piece_type) return [];
-    return getAllowedSquares(officialChess, game.allowed_piece_type);
-  }, [officialChess, game?.allowed_piece_type]);
+    if (!officialChess || !allowedPieceType) return [];
+    return getAllowedSquares(officialChess, allowedPieceType);
+  }, [officialChess, allowedPieceType]);
 
   const legalTargetsFromSelected = useMemo(() => {
-    if (!officialChess || !selectedSquare || !game?.allowed_piece_type) return [];
+    if (!officialChess || !selectedSquare || !allowedPieceType) return [];
 
     return officialChess
       .moves({ square: selectedSquare, verbose: true })
-      .filter((move) => move.piece === game.allowed_piece_type)
+      .filter((move) => move.piece === allowedPieceType)
       .map((move) => move.to as Square);
-  }, [officialChess, selectedSquare, game?.allowed_piece_type]);
+  }, [officialChess, selectedSquare, allowedPieceType]);
 
   const legalTypesForCurrentTurn = useMemo(() => {
     if (!officialChess || game?.status !== "active") return [];
@@ -338,104 +410,94 @@ export default function GameRoom({ gameId }: { gameId: string }) {
   const isMyTurn = !!game && !!myPlayer && game.current_turn === myPlayer.color;
 
   const canInteract =
-    !!game &&
-    !!myPlayer &&
-    game.status === "active" &&
-    !!game.allowed_piece_type &&
+    game?.status === "active" &&
+    !!allowedPieceType &&
     isMyTurn &&
     !actionLoading &&
     !isRolling;
 
   const canRoll =
-    !!game &&
-    !!myPlayer &&
-    game.status === "active" &&
+    game?.status === "active" &&
     !game.allowed_piece_type &&
     isMyTurn &&
-    !actionLoading &&
-    !isRolling;
+    !actionLoading;
 
-  const statusText = game ? getStatusText(game) : "Yükleniyor";
-  const resultText = game ? getResultText(game) : null;
+  const myUserId = myPlayer?.user_id ?? null;
 
-  const opponentPlayer = useMemo(() => {
-    if (!myPlayer) return null;
-    return players.find((p) => p.user_id !== myPlayer.user_id) ?? null;
-  }, [players, myPlayer]);
+  const submitMove = useCallback(
+    async (from: Square, to: Square, promotion?: PromotionChoice) => {
+      const current = gameRef.current;
+      if (!current || inFlightRef.current) return false;
 
-  const commitMove = useCallback(
-    async (
-      currentGame: DbGame,
-      from: Square,
-      to: Square,
-      previousOptimistic: string | null
-    ) => {
+      let fenAfter: string;
       try {
-        const result = await makeMove({
-          gameId: currentGame.id,
+        fenAfter = simulateMoveLocally({
+          fen: current.fen,
+          allowedPieceType: current.allowed_piece_type,
           from,
           to,
-        });
-
-        setGame(result.game);
-        setOptimisticFen(null);
-
-        if (result.game.status === "finished") {
-          setMessage(getResultText(result.game) ?? "Oyun bitti.");
-        } else {
-          setMessage("Zar dönüyor...");
-        }
+          promotion,
+        }).fenAfter;
       } catch (e) {
-        setOptimisticFen(previousOptimistic);
+        setError(e instanceof Error ? e.message : "Hamle yapılamadı.");
+        return false;
+      }
 
-        const msg = e instanceof Error ? e.message : "Hamle yapılamadı.";
-        setError(msg);
+      inFlightRef.current = true;
+      setActionLoading(true);
+      setError("");
+      setSelectedSquare(null);
+      setPendingPromotion(null);
+      setOptimisticFen(fenAfter);
+
+      try {
+        const result = await makeMove({ gameId: current.id, from, to, promotion });
+        applyGame(result.game);
+      } catch (e) {
+        // Yanıt kaybolmuş olabilir: hamle yazıldıysa hata yoktur, tahta DB'ye döner.
+        const fresh = await getGame(current.id).catch(() => null);
+        if (fresh) applyGame(fresh);
+
+        if (!fresh || fresh.move_count <= current.move_count) {
+          setError(
+            e instanceof Error
+              ? `${e.message} Hamle geri alındı.`
+              : "Hamle yapılamadı, geri alındı."
+          );
+        }
       } finally {
+        inFlightRef.current = false;
+        setOptimisticFen(null);
         setActionLoading(false);
       }
+
+      return true;
     },
-    []
+    [applyGame]
   );
 
   const handleMove = useCallback(
     (from: Square, to: Square) => {
-      if (!game || !canInteract) return false;
+      const current = gameRef.current;
+      if (!current || !canInteract || inFlightRef.current) return false;
 
-      const previousOptimistic = optimisticFen ?? null;
-
-      try {
-        setActionLoading(true);
-        setError("");
+      if (moveNeedsPromotion(current.fen, from, to, current.allowed_piece_type)) {
         setSelectedSquare(null);
-
-        const local = simulateMoveLocally({
-          fen: game.fen,
-          allowedPieceType: game.allowed_piece_type,
-          from,
-          to,
-        });
-
-        setOptimisticFen(local.fenAfter);
-        setMessage("Hamle gönderiliyor...");
-
-        void commitMove(game, from, to, previousOptimistic);
-        return true;
-      } catch (e) {
-        setActionLoading(false);
-
-        const msg = e instanceof Error ? e.message : "Hamle yapılamadı.";
-        setError(msg);
+        setPendingPromotion({ from, to });
         return false;
       }
+
+      void submitMove(from, to);
+      return true;
     },
-    [canInteract, commitMove, game, optimisticFen]
+    [canInteract, submitMove]
   );
 
   const handleSquareClick = useCallback<
     NonNullable<ChessboardOptions["onSquareClick"]>
   >(
     ({ square }) => {
-      if (!canInteract) return;
+      if (!canInteract || pendingPromotion) return;
 
       const clickedSquare = square as Square;
 
@@ -444,7 +506,7 @@ export default function GameRoom({ gameId }: { gameId: string }) {
         return;
       }
 
-      if (allowedSquares.includes(clickedSquare)) {
+      if (clickedSquare !== selectedSquare && allowedSquares.includes(clickedSquare)) {
         setSelectedSquare(clickedSquare);
         return;
       }
@@ -456,6 +518,7 @@ export default function GameRoom({ gameId }: { gameId: string }) {
       canInteract,
       handleMove,
       legalTargetsFromSelected,
+      pendingPromotion,
       selectedSquare,
     ]
   );
@@ -465,6 +528,7 @@ export default function GameRoom({ gameId }: { gameId: string }) {
   >(
     ({ sourceSquare, targetSquare }) => {
       if (!targetSquare || !canInteract) return false;
+      if (sourceSquare === targetSquare) return false;
 
       if (!allowedSquares.includes(sourceSquare as Square)) {
         return false;
@@ -476,47 +540,72 @@ export default function GameRoom({ gameId }: { gameId: string }) {
   );
 
   const handleRoll = async () => {
-    if (!game || !canRoll) return;
+    if (!game || !canRoll || inFlightRef.current) return;
+
+    inFlightRef.current = true;
+    setActionLoading(true);
+    setError("");
 
     try {
-      setActionLoading(true);
-      setError("");
-      setMessage("Zar atılıyor...");
-
-      const updated = await rollForCurrentTurn(game.id);
-      setGame(updated);
+      applyGame(await rollForCurrentTurn(game.id));
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Zar atılamadı.";
-      setError(msg);
+      setError(e instanceof Error ? e.message : "Zar atılamadı.");
+      void refresh();
     } finally {
+      inFlightRef.current = false;
       setActionLoading(false);
     }
   };
 
   const handleCopyCode = async () => {
-    if (!game?.lobby_code) return;
-
-    await navigator.clipboard.writeText(game.lobby_code);
-    setCopySuccess(true);
-    setMessage(`Lobi kodu kopyalandı: ${game.lobby_code}`);
-  };
-
-  const handleResign = async () => {
     if (!game) return;
 
     try {
-      setActionLoading(true);
-      setError("");
+      await copyText(game.lobby_code);
+      setNotice("Kod kopyalandı");
+    } catch {
+      setNotice(`Kod: ${game.lobby_code}`);
+    }
+  };
 
-      const updated = await resignGame(game.id);
-      setGame(updated);
-      setOptimisticFen(null);
+  const handleShare = async () => {
+    if (!game) return;
 
-      await loadAll();
+    try {
+      await navigator.share({
+        title: "Zarlı Satranç",
+        text: `Zarlı Satranç oynayalım. Lobi kodu: ${game.lobby_code}`,
+        url: `${window.location.origin}/?kod=${game.lobby_code}`,
+      });
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Pes işlemi başarısız.";
-      setError(msg);
+      // Kullanıcı paylaşım penceresini kapattıysa yapılacak bir şey yok.
+      if (e instanceof Error && e.name !== "AbortError") {
+        await handleCopyCode();
+      }
+    }
+  };
+
+  const handleResign = async () => {
+    if (!game || inFlightRef.current) return;
+
+    if (!confirmingResign) {
+      setConfirmingResign(true);
+      return;
+    }
+
+    setConfirmingResign(false);
+    inFlightRef.current = true;
+    setActionLoading(true);
+    setError("");
+
+    try {
+      applyGame(await resignGame(game.id));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Pes işlemi başarısız.");
+      void refresh();
     } finally {
+      inFlightRef.current = false;
+      setOptimisticFen(null);
       setActionLoading(false);
     }
   };
@@ -524,10 +613,12 @@ export default function GameRoom({ gameId }: { gameId: string }) {
   const squareStyles = useMemo(() => {
     const styles: Record<string, CSSProperties> = {};
 
-    for (const square of allowedSquares) {
-      styles[square] = {
-        boxShadow: "inset 0 0 0 4px rgba(132,204,22,0.95)",
-      };
+    if (canInteract) {
+      for (const square of allowedSquares) {
+        styles[square] = {
+          boxShadow: "inset 0 0 0 4px rgba(132,204,22,0.95)",
+        };
+      }
     }
 
     for (const square of legalTargetsFromSelected) {
@@ -545,7 +636,7 @@ export default function GameRoom({ gameId }: { gameId: string }) {
     }
 
     return styles;
-  }, [allowedSquares, legalTargetsFromSelected, selectedSquare]);
+  }, [allowedSquares, canInteract, legalTargetsFromSelected, selectedSquare]);
 
   const boardOrientation: "white" | "black" =
     myPlayer?.color === "b" ? "black" : "white";
@@ -577,15 +668,9 @@ export default function GameRoom({ gameId }: { gameId: string }) {
     ]
   );
 
-  const STRIP_ITEM_WIDTH = 96;
-  const STRIP_VIEW_WIDTH = 288;
-  const stripFinalX =
-    STRIP_VIEW_WIDTH / 2 -
-    (rollTargetIndex * STRIP_ITEM_WIDTH + STRIP_ITEM_WIDTH / 2);
-
   if (loading) {
     return (
-      <div className="flex h-screen items-center justify-center bg-[#161512] text-white">
+      <div className="flex h-dvh items-center justify-center bg-[#161512] text-white">
         <div className="rounded-3xl border border-white/10 bg-white/5 px-6 py-4 text-sm text-white/70">
           Oyun yükleniyor...
         </div>
@@ -593,16 +678,21 @@ export default function GameRoom({ gameId }: { gameId: string }) {
     );
   }
 
-  if (!game) {
+  if (!game || gone) {
     return (
-      <div className="flex h-screen flex-col items-center justify-center gap-4 bg-[#161512] text-white">
-        <div className="rounded-3xl border border-red-500/20 bg-red-500/10 px-6 py-4 text-sm text-red-200">
-          {error || "Oyun bulunamadı."}
+      <div className="flex h-dvh flex-col items-center justify-center gap-4 bg-[#161512] p-6 text-center text-white">
+        <div
+          data-testid="room-error"
+          className="rounded-3xl border border-red-500/20 bg-red-500/10 px-6 py-4 text-sm text-red-200"
+        >
+          {gone
+            ? "Bu oyun artık yok. Süresi dolmuş olabilir ya da bu oyunun oyuncusu değilsin."
+            : error || "Oyun bulunamadı."}
         </div>
 
         <button
           onClick={() => router.push("/")}
-          className="rounded-2xl bg-white px-4 py-2 text-black"
+          className="min-h-11 rounded-2xl bg-white px-5 py-2 font-semibold text-black"
         >
           Ana Menüye Dön
         </button>
@@ -610,283 +700,301 @@ export default function GameRoom({ gameId }: { gameId: string }) {
     );
   }
 
+  const statusText = getStatusText(game, myPlayer?.color ?? null);
+  const stripFinalX = rollAnim
+    ? STRIP_VIEW_WIDTH / 2 -
+      (rollAnim.targetIndex * STRIP_ITEM_WIDTH + STRIP_ITEM_WIDTH / 2)
+    : 0;
+  const showStrip = isRolling && rollAnim?.key === revealKey;
+  const canShare = typeof navigator.share === "function";
+  const showGameOver = game.status === "finished" && !endDismissed;
+
+  const hint =
+    error ||
+    notice ||
+    (game.status === "waiting"
+      ? "Kodu rakibinle paylaş. O katılınca oyun başlar."
+      : game.status === "finished"
+      ? getResultText(game, myUserId)
+      : actionLoading
+      ? "Gönderiliyor..."
+      : canRoll
+      ? "Sıra sende. Zarı atarak turu başlat."
+      : isRolling
+      ? "Zar dönüyor..."
+      : isMyTurn && displayedPieceType
+      ? `${PIECE_LABELS[displayedPieceType]} ile oyna: taşa, sonra hedef kareye dokun.`
+      : "Sıra rakipte.");
+
   return (
-    <div className="h-screen w-full bg-[#161512] p-3 lg:p-4">
-      <div className="grid h-full w-full grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <section className="rounded-[28px] border border-white/8 bg-[#201e1b] p-3 lg:p-4">
-          <div className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] gap-3">
-            <div className="flex items-center justify-between rounded-2xl bg-black/10 px-4 py-3">
-              <div>
-                <div className="text-xs uppercase tracking-[0.2em] text-white/35">
-                  Rakip
-                </div>
-                <div className="mt-1 text-sm font-semibold text-white/90">
-                  {opponentPlayer
-                    ? `Bağlandı • ${
-                        opponentPlayer.color === "w" ? "Beyaz" : "Siyah"
-                      }`
-                    : "Rakip Bekleniyor"}
-                </div>
-              </div>
+    <div
+      className="room"
+      data-testid="game-room"
+      data-fen={game.fen}
+      data-board-fen={boardFen}
+      data-turn={game.current_turn}
+      data-piece={game.allowed_piece_type ?? ""}
+      data-shown-piece={displayedPieceType ?? ""}
+      data-status={game.status}
+      data-result={game.result_reason ?? ""}
+      data-move-count={game.move_count}
+      data-version={game.version}
+      data-rolling={isRolling}
+      data-can-move={canInteract}
+      data-can-roll={canRoll}
+      data-color={myPlayer?.color ?? ""}
+    >
+      <header className="room-top">
+        <div className="min-w-0">
+          <div className="truncate text-sm font-bold text-white" data-testid="status-text">
+            {statusText}
+          </div>
+          <div className="truncate text-xs text-white/50">
+            {myPlayer ? `Sen: ${colorName(myPlayer.color)}` : "İzleyici"}
+            {" · "}
+            {opponentPlayer ? `Rakip: ${colorName(opponentPlayer.color)}` : "Rakip yok"}
+          </div>
+        </div>
 
-              <div className="rounded-full border border-white/8 bg-white/5 px-4 py-2 text-sm font-semibold text-white/75">
-                {game.status === "waiting" ? "Bekleniyor" : statusText}
-              </div>
-            </div>
-
-            <div
-              ref={boardAreaRef}
-              className="relative flex min-h-0 items-center justify-center overflow-hidden rounded-[24px] bg-[#262421]"
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          {connection !== "connected" ? (
+            <span
+              data-testid="connection-status"
+              className="rounded-full border border-amber-400/30 bg-amber-400/10 px-2.5 py-0.5 text-xs font-semibold text-amber-200"
             >
+              Bağlanıyor…
+            </span>
+          ) : null}
+          {opponentOffline ? (
+            <span
+              data-testid="opponent-offline"
+              className="rounded-full border border-red-400/30 bg-red-400/10 px-2.5 py-0.5 text-xs font-semibold text-red-200"
+            >
+              Rakip çevrimdışı
+            </span>
+          ) : null}
+        </div>
+      </header>
+
+      <section className="room-dice">
+        <div className="flex items-center gap-3">
+          <div className="min-w-0 flex-1">
+            {showStrip && rollAnim ? (
               <div
-                className="relative rounded-[10px] shadow-2xl"
-                style={{
-                  width: `${boardSize}px`,
-                  height: `${boardSize}px`,
-                  maxWidth: "100%",
-                  maxHeight: "100%",
-                }}
+                className="relative mx-auto overflow-hidden rounded-xl"
+                style={{ width: STRIP_VIEW_WIDTH }}
               >
-                <Chessboard options={chessboardOptions} />
-              </div>
-
-              {game.status === "waiting" ? (
-                <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
-                  <div className="rounded-[28px] border border-white/10 bg-[#161512]/90 px-8 py-7 text-center shadow-2xl">
-                    <div className="text-xs uppercase tracking-[0.22em] text-white/35">
-                      Lobi Açık
+                <div
+                  className="pointer-events-none absolute inset-y-0 left-1/2 z-10 -translate-x-1/2 rounded-xl border border-amber-400/40 bg-amber-400/10"
+                  style={{ width: STRIP_ITEM_WIDTH }}
+                />
+                <motion.div
+                  key={rollAnim.key}
+                  className="flex"
+                  initial={{ x: 0 }}
+                  animate={{ x: stripFinalX }}
+                  transition={{
+                    duration: ROLL_DURATION_MS / 1000,
+                    ease: [0.08, 0.82, 0.16, 1],
+                  }}
+                >
+                  {rollAnim.strip.map((piece, index) => (
+                    <div
+                      key={`${piece}-${index}`}
+                      className="flex h-11 shrink-0 items-center justify-center text-base font-black text-white"
+                      style={{ width: STRIP_ITEM_WIDTH }}
+                    >
+                      {PIECE_LABELS[piece]}
                     </div>
-                    <div className="mt-3 text-3xl font-black tracking-[0.25em] text-white">
-                      {game.lobby_code}
-                    </div>
-                    <div className="mt-3 text-sm text-white/60">
-                      Rakip katılınca oyun aktif olur. Sırası gelen oyuncu zarı
-                      atarak turu başlatır.
-                    </div>
-                  </div>
-                </div>
-              ) : null}
-            </div>
-
-            <div className="flex items-center justify-between rounded-2xl bg-black/10 px-4 py-3">
-              <div>
-                <div className="text-xs uppercase tracking-[0.2em] text-white/35">
-                  Sen
-                </div>
-                <div className="mt-1 text-sm font-semibold text-white/90">
-                  {myPlayer
-                    ? `${myPlayer.color === "w" ? "Beyaz" : "Siyah"} oyuncu`
-                    : "Oyuncu"}
-                </div>
+                  ))}
+                </motion.div>
               </div>
-
-              <div className="rounded-full border border-white/8 bg-white/5 px-4 py-2 text-sm font-semibold text-white/75">
-                Kod: {game.lobby_code}
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <aside className="flex min-h-0 flex-col gap-4 rounded-[28px] border border-white/8 bg-[#1a1816] p-4">
-          <div className="grid grid-cols-2 gap-2">
-            <button className="rounded-2xl bg-[#2a2825] px-4 py-3 text-sm font-semibold text-white">
-              Oyun
-            </button>
-            <button
-              onClick={() => router.push("/")}
-              className="rounded-2xl bg-[#2a2825] px-4 py-3 text-sm font-semibold text-white/75 transition hover:bg-[#34312d]"
-            >
-              Ana Menü
-            </button>
-          </div>
-
-          <div className="rounded-[24px] bg-[#24211f] p-4">
-            <div className="text-xs uppercase tracking-[0.2em] text-white/35">
-              Lobi
-            </div>
-
-            <div className="mt-4 rounded-[20px] bg-[#171513] px-4 py-5 text-center">
-              <div className="text-sm text-white/40">Lobi Kodu</div>
-              <div className="mt-3 text-4xl font-black tracking-[0.34em] text-white">
-                {game.lobby_code}
-              </div>
-            </div>
-
-            <button
-              onClick={handleCopyCode}
-              className="mt-3 w-full rounded-[18px] bg-[#2f2c28] px-5 py-4 text-base font-bold text-white transition hover:bg-[#3a3733]"
-            >
-              {copySuccess ? "Kopyalandı" : "Kodu Kopyala"}
-            </button>
-          </div>
-
-          <div className="rounded-[24px] bg-[#24211f] p-4">
-            <div className="flex items-center justify-between">
-              <div className="text-xs uppercase tracking-[0.2em] text-white/35">
-                Zar Sonucu
-              </div>
-
-              {isRolling ? (
-                <div className="rounded-full border border-amber-400/20 bg-amber-400/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-amber-200">
-                  Zar dönüyor
-                </div>
-              ) : null}
-            </div>
-
-            {canRoll ? (
+            ) : canRoll ? (
               <button
                 onClick={handleRoll}
                 disabled={actionLoading}
-                className="mt-4 w-full rounded-[18px] bg-amber-500 px-5 py-4 text-base font-black text-black transition hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-60"
+                data-testid="roll-button"
+                className="min-h-11 w-full rounded-xl bg-amber-500 px-4 py-2 text-base font-black text-black active:bg-amber-400 disabled:opacity-60"
               >
                 {actionLoading ? "Zar Atılıyor..." : "Zarı At"}
               </button>
-            ) : null}
+            ) : (
+              <div className="flex min-h-11 items-center gap-2">
+                <span className="text-xs uppercase tracking-wider text-white/40">
+                  Zar
+                </span>
+                <span
+                  data-testid="dice-value"
+                  className="text-2xl font-black leading-none text-white"
+                >
+                  {displayedPieceType ? PIECE_LABELS[displayedPieceType] : "—"}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
 
-            <div className="mt-4 rounded-[20px] border border-white/8 bg-[#151311] px-3 py-4">
-              {isRolling && rollStrip.length > 0 ? (
-                <>
-                  <div className="relative mx-auto w-[288px] overflow-hidden rounded-[18px]">
-                    <div className="pointer-events-none absolute inset-y-0 left-1/2 z-10 w-[96px] -translate-x-1/2 rounded-[16px] border border-amber-400/35 bg-amber-400/10 shadow-[0_0_20px_rgba(251,191,36,0.15)]" />
+        <div className="room-wide-only mt-3 flex flex-wrap gap-2">
+          {legalTypesForCurrentTurn.map((piece) => (
+            <span
+              key={piece}
+              className={`rounded-full border px-3 py-1 text-xs font-semibold ${
+                displayedPieceType === piece
+                  ? "border-amber-400/35 bg-amber-400/10 text-amber-100"
+                  : "border-white/10 bg-white/5 text-white/70"
+              }`}
+            >
+              {PIECE_LABELS[piece]}
+            </span>
+          ))}
+        </div>
 
-                    <motion.div
-                      key={rollAnimKey}
-                      className="flex"
-                      initial={{ x: 0 }}
-                      animate={{ x: stripFinalX }}
-                      transition={{
-                        duration: 3,
-                        ease: [0.08, 0.82, 0.16, 1],
-                      }}
+        <p
+          data-testid="hint"
+          role={error ? "alert" : undefined}
+          className={`mt-1 line-clamp-2 min-h-8 text-xs leading-4 ${
+            error ? "text-red-300" : "text-white/65"
+          }`}
+        >
+          {hint}
+        </p>
+      </section>
+
+      <div className="room-board">
+        <div className="room-board-inner" data-testid="board">
+          <Chessboard options={chessboardOptions} />
+
+          {game.status === "waiting" ? (
+            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/40 p-3">
+              <div className="w-full max-w-xs rounded-2xl border border-white/10 bg-[#161512]/95 p-4 text-center">
+                <div className="text-xs uppercase tracking-[0.2em] text-white/40">
+                  Lobi Kodu
+                </div>
+                <div
+                  data-testid="lobby-code"
+                  className="mt-2 text-3xl font-black tracking-[0.2em] text-white"
+                >
+                  {game.lobby_code}
+                </div>
+                <div className="mt-3 grid gap-2">
+                  <button
+                    onClick={handleCopyCode}
+                    data-testid="copy-code"
+                    className="min-h-11 rounded-xl bg-white/10 px-4 font-bold text-white active:bg-white/20"
+                  >
+                    Kodu Kopyala
+                  </button>
+                  {canShare ? (
+                    <button
+                      onClick={handleShare}
+                      data-testid="share-code"
+                      className="min-h-11 rounded-xl bg-[#86b94b] px-4 font-bold text-white active:brightness-110"
                     >
-                      {rollStrip.map((piece, index) => (
-                        <div
-                          key={`${piece}-${index}`}
-                          className="flex h-[110px] w-[96px] shrink-0 flex-col items-center justify-center"
-                        >
-                          <div className="text-[11px] uppercase tracking-[0.18em] text-white/35">
-                            Taş
-                          </div>
-                          <div className="mt-2 text-2xl font-black text-white">
-                            {PIECE_LABELS[piece]}
-                          </div>
-                        </div>
-                      ))}
-                    </motion.div>
-                  </div>
-
-                  <div className="mt-4 flex flex-wrap justify-center gap-2">
-                    {legalTypesForCurrentTurn.map((piece) => (
-                      <div
-                        key={piece}
-                        className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-white/70"
-                      >
-                        {PIECE_LABELS[piece]}
-                      </div>
-                    ))}
-                  </div>
-                </>
-              ) : (
-                <div className="flex min-h-[170px] flex-col items-center justify-center rounded-[18px] bg-black/10">
-                  <div className="text-sm text-white/40">Bu tur</div>
-                  <div className="mt-3 text-5xl font-black tracking-tight text-white">
-                    {displayedPieceType
-                      ? PIECE_LABELS[displayedPieceType]
-                      : game.status === "waiting"
-                      ? "Bekleniyor"
-                      : canRoll
-                      ? "Zar Bekliyor"
-                      : "—"}
-                  </div>
-
-                  {legalTypesForCurrentTurn.length > 0 ? (
-                    <div className="mt-4 flex flex-wrap justify-center gap-2 px-4">
-                      {legalTypesForCurrentTurn.map((piece) => (
-                        <div
-                          key={piece}
-                          className={`rounded-full border px-3 py-1 text-xs font-semibold ${
-                            displayedPieceType === piece
-                              ? "border-amber-400/35 bg-amber-400/10 text-amber-100"
-                              : "border-white/10 bg-white/5 text-white/70"
-                          }`}
-                        >
-                          {PIECE_LABELS[piece]}
-                        </div>
-                      ))}
-                    </div>
+                      Paylaş
+                    </button>
                   ) : null}
                 </div>
-              )}
-            </div>
-
-            <div className="mt-4 rounded-2xl bg-black/15 px-4 py-3 text-sm leading-6 text-white/70">
-              {game.status === "waiting"
-                ? "Rakip katılınca oyun aktif olur. İlk tur zarı atarak başlar."
-                : game.status === "finished"
-                ? resultText || "Oyun sona erdi."
-                : canRoll
-                ? "Sıra sende. Zarı atarak turu başlat."
-                : isRolling
-                ? "Legal taş türleri arasında zar dönüyor..."
-                : displayedPieceType
-                ? `Sadece ${PIECE_LABELS[displayedPieceType]} ile hamle yapabilirsin.`
-                : "Hamle bilgisi bekleniyor."}
-            </div>
-          </div>
-
-          <div className="rounded-[24px] bg-[#24211f] p-4">
-            <div className="text-xs uppercase tracking-[0.2em] text-white/35">
-              Oyun Durumu
-            </div>
-
-            <div className="mt-3 text-2xl font-black text-white">
-              {statusText}
-            </div>
-
-            <div className="mt-3 grid grid-cols-2 gap-3">
-              <div className="rounded-2xl bg-black/15 px-4 py-3">
-                <div className="text-xs uppercase tracking-[0.16em] text-white/35">
-                  Sıra
-                </div>
-                <div className="mt-2 text-sm font-semibold text-white">
-                  {game.current_turn === "w" ? "Beyaz" : "Siyah"}
-                </div>
-              </div>
-
-              <div className="rounded-2xl bg-black/15 px-4 py-3">
-                <div className="text-xs uppercase tracking-[0.16em] text-white/35">
-                  Oyuncular
-                </div>
-                <div className="mt-2 text-sm font-semibold text-white">
-                  {players.length}/2
-                </div>
               </div>
             </div>
+          ) : null}
 
-            <div className="mt-4 rounded-2xl bg-black/15 px-4 py-3 text-sm leading-6 text-white/72">
-              {error ||
-                message ||
-                (!realtimeConnected
-                  ? "Realtime kapalı. Oyun kısa aralıklarla yenileniyor."
-                  : isRolling
-                  ? "Zar sonucu netleşiyor..."
-                  : canRoll
-                  ? "Sıra sende. Zarı atarak turu başlat."
-                  : isMyTurn
-                  ? "Sıra sende. Hamleni yapabilirsin."
-                  : "Sıra rakipte.")}
+          {pendingPromotion ? (
+            <div
+              data-testid="promotion-picker"
+              className="absolute inset-0 z-30 flex items-center justify-center bg-black/55 p-3"
+            >
+              <div className="w-full max-w-xs rounded-2xl border border-white/10 bg-[#161512] p-4">
+                <div className="text-center text-sm font-bold text-white">
+                  Piyon neye terfi etsin?
+                </div>
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  {PROMOTION_CHOICES.map((piece) => (
+                    <button
+                      key={piece}
+                      data-testid={`promote-${piece}`}
+                      onClick={() =>
+                        void submitMove(
+                          pendingPromotion.from,
+                          pendingPromotion.to,
+                          piece
+                        )
+                      }
+                      className="min-h-12 rounded-xl bg-white/10 font-bold text-white active:bg-white/20"
+                    >
+                      {PIECE_LABELS[piece]}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  data-testid="promotion-cancel"
+                  onClick={() => setPendingPromotion(null)}
+                  className="mt-2 min-h-11 w-full rounded-xl text-sm font-semibold text-white/70 active:bg-white/10"
+                >
+                  Vazgeç
+                </button>
+              </div>
             </div>
-          </div>
+          ) : null}
 
-          <button
-            onClick={handleResign}
-            disabled={actionLoading || game.status !== "active"}
-            className="mt-auto rounded-[18px] border border-white/10 bg-white/5 px-5 py-4 text-base font-bold text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {actionLoading ? "İşleniyor..." : "Pes Et"}
-          </button>
-        </aside>
+          {showGameOver ? (
+            <div
+              data-testid="game-over"
+              className="absolute inset-0 z-30 flex items-center justify-center bg-black/55 p-3"
+            >
+              <div className="w-full max-w-xs rounded-2xl border border-white/10 bg-[#161512] p-5 text-center">
+                <div
+                  data-testid="game-over-title"
+                  className="text-3xl font-black text-white"
+                >
+                  {getResultTitle(game, myUserId)}
+                </div>
+                <div className="mt-2 text-sm text-white/70">
+                  {getResultText(game, myUserId)}
+                </div>
+                <button
+                  onClick={() => router.push("/")}
+                  className="mt-4 min-h-11 w-full rounded-xl bg-[#86b94b] px-4 font-bold text-white active:brightness-110"
+                >
+                  Yeni Oyun
+                </button>
+                <button
+                  onClick={() => setEndDismissed(true)}
+                  className="mt-2 min-h-11 w-full rounded-xl text-sm font-semibold text-white/70 active:bg-white/10"
+                >
+                  Tahtayı Gör
+                </button>
+              </div>
+            </div>
+          ) : null}
+        </div>
       </div>
+
+      <footer className="room-actions">
+        <button
+          onClick={() => router.push("/")}
+          className="min-h-11 flex-1 rounded-xl bg-white/5 px-3 text-sm font-semibold text-white/80 active:bg-white/10"
+        >
+          Ana Menü
+        </button>
+        <button
+          onClick={canShare ? handleShare : handleCopyCode}
+          className="min-h-11 flex-1 rounded-xl bg-white/5 px-3 text-sm font-semibold text-white/80 active:bg-white/10"
+        >
+          {canShare ? "Paylaş" : "Kod"}: {game.lobby_code}
+        </button>
+        <button
+          onClick={handleResign}
+          disabled={actionLoading || game.status !== "active"}
+          data-testid="resign-button"
+          className={`min-h-11 flex-1 rounded-xl px-3 text-sm font-bold disabled:opacity-40 ${
+            confirmingResign
+              ? "bg-red-500 text-white"
+              : "bg-white/5 text-white/80 active:bg-white/10"
+          }`}
+        >
+          {confirmingResign ? "Emin misin?" : "Pes Et"}
+        </button>
+      </footer>
     </div>
   );
 }
