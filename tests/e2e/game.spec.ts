@@ -55,20 +55,99 @@ test("tam oyun: lobi, kodla katılma, zar, hamleler, mat, oyun sonu", async () =
 
   // Oyun bittikten sonra hamle gönderilemez.
   expect(end.canMove).toBe(false);
-  const late = await callRpc(
-    game.white.page,
-    "record_move",
-    recordMoveArgs(game.id, 5, "a3", "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3")
-  );
+  expect(unexpectedConsole(game.white)).toEqual([]);
+  expect(unexpectedConsole(game.black)).toEqual([]);
+
+  const late = await callRpc(game.white.page, "record_move", {
+    p_game_id: game.id,
+    p_move_number: 5,
+    p_piece_type: "p",
+    p_from_square: "a2",
+    p_to_square: "a3",
+    p_promotion: null,
+    p_san: "a3",
+    p_uci: "a2a3",
+    p_fen_after: "rnb1kbnr/pppp1ppp/8/4p3/6Pq/P4P2/1PPPP2P/RNBQKBNR b KQkq - 0 3",
+    p_result_reason: null,
+    p_next_piece_type: "p",
+    p_next_legal_piece_types: ["p"],
+  });
   expect(late.ok).toBe(false);
+  expect(late.body.message).toContain("Oyun aktif değil");
 
   // Yenilenince oyun sonu aynı gelir.
   await game.black.page.reload();
   await expect(game.black.page.getByTestId("game-over-title")).toHaveText("Kazandın");
   await expectInSync(game);
-
-  expect(unexpectedConsole(game.white)).toEqual([]);
   expect(unexpectedConsole(game.black)).toEqual([]);
+});
+
+test("canlı akış: broadcast olmadan da postgres_changes rakibi anında günceller", async () => {
+  game = await startGame();
+  const { white, black } = game;
+  await expect.poll(async () => (await state(white.page)).canRoll).toBe(true);
+  await expect(black.page.getByTestId("connection-status")).toBeHidden();
+  await black.page.waitForTimeout(1500);
+
+  // Doğrudan RPC broadcast göndermez; tek canlı yol postgres_changes. Yedek okuma
+  // 10 saniyede bir çalıştığı için üç adımın da 4 saniye içinde gelmesi gerekir.
+  const started = await state(black.page);
+  const roll = await callRpc(white.page, "save_dice_roll", {
+    p_game_id: game.id,
+    p_move_number: 1,
+    p_rolled_piece_type: "p",
+    p_legal_piece_types: ["p", "n"],
+  });
+  expect(roll.ok).toBe(true);
+  await expect
+    .poll(async () => (await state(black.page)).version, { timeout: 4_000, intervals: [100] })
+    .toBeGreaterThan(started.version);
+
+  let fen = (await state(white.page)).fen;
+  for (const [index, san] of ["e4", "e5", "d4"].entries()) {
+    const chess = new Chess(fen);
+    const move = chess.move(san);
+    const reader = move.color === "w" ? black : white;
+    const writer = move.color === "w" ? white : black;
+    const write = await callRpc(writer.page, "record_move", {
+      p_game_id: game.id,
+      p_move_number: index + 1,
+      p_piece_type: "p",
+      p_from_square: move.from,
+      p_to_square: move.to,
+      p_promotion: null,
+      p_san: move.san,
+      p_uci: move.from + move.to,
+      p_fen_after: chess.fen(),
+      p_result_reason: null,
+      p_next_piece_type: "p",
+      p_next_legal_piece_types: ["p"],
+    });
+    expect(write.ok).toBe(true);
+    await expect
+      .poll(async () => (await state(reader.page)).moveCount, { timeout: 4_000, intervals: [100] })
+      .toBe(index + 1);
+    fen = chess.fen();
+  }
+
+  await expectInSync(game);
+});
+
+test("uygulamaya dönünce (visibilitychange, focus) oyun DB'den yeniden okunur", async () => {
+  game = await startGame();
+  const page = game.black.page;
+  // Açılıştaki ilk okumalar bitsin.
+  await page.waitForTimeout(1500);
+
+  for (const trigger of [
+    () => document.dispatchEvent(new Event("visibilitychange")),
+    () => window.dispatchEvent(new Event("focus")),
+  ]) {
+    const request = page.waitForRequest(/\/rest\/v1\/games/, { timeout: 3_000 });
+    await page.evaluate(trigger);
+    await request;
+    await page.waitForTimeout(500);
+  }
 });
 
 test("oyun ortasında sayfa yenilenince tahta, zar ve sıra aynı gelir", async () => {
@@ -337,6 +416,7 @@ test("mobil yerleşim: tahta sığar, kareler kare, kaydırma yok, dokunma alanl
   ]) {
     await page.setViewportSize({ width, height });
     await page.waitForTimeout(200);
+    await page.screenshot({ path: `test-results/layout-${width}x${height}.png` });
 
     const metrics = await page.evaluate(() => {
       const root = document.documentElement;
@@ -386,6 +466,19 @@ test("paylaşılan bağlantı kodu doldurur, kopyala butonu çalışır", async 
 
   await host.page.goto(`/?kod=${code}`);
   await expect(host.page.getByTestId("code-input")).toHaveValue(code);
+
+  // iOS, 16px altındaki girişlerde sayfayı yakınlaştırır.
+  const fontSize = await host.page
+    .getByTestId("code-input")
+    .evaluate((el) => parseFloat(getComputedStyle(el).fontSize));
+  expect(fontSize).toBeGreaterThanOrEqual(16);
+
+  await host.page.setViewportSize({ width: 360, height: 640 });
+  await host.page.screenshot({ path: "test-results/home-360.png", fullPage: true });
+  const overflow = await host.page.evaluate(
+    () => document.documentElement.scrollWidth - window.innerWidth
+  );
+  expect(overflow).toBeLessThanOrEqual(0);
   await closePlayer(host);
 });
 

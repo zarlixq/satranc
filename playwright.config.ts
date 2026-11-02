@@ -15,7 +15,10 @@ export default defineConfig({
   reporter: [["list"]],
   use: { baseURL: `http://localhost:${PORT}` },
   webServer: {
-    command: `npm run build && npm run start -- -p ${PORT}`,
+    // E2E_DEV=1: geliştirme modunda (React Strict Mode çift mount yapar) çalıştırır.
+    command: process.env.E2E_DEV
+      ? `npx next dev -p ${PORT}`
+      : `npm run build && npm run start -- -p ${PORT}`,
     url: `http://localhost:${PORT}`,
     reuseExistingServer: true,
     timeout: 240_000,

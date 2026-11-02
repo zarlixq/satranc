@@ -94,7 +94,7 @@ export default function HomeLobby() {
       </div>
 
       <div className="relative mx-auto flex min-h-dvh max-w-7xl items-center px-4 py-[max(1.5rem,env(safe-area-inset-top))] md:px-8">
-        <div className="grid w-full items-center gap-8 lg:grid-cols-[1.1fr_0.9fr]">
+        <div className="grid w-full items-center gap-5 md:gap-8 lg:grid-cols-[1.1fr_0.9fr]">
           <div className="max-w-2xl">
             <p className="text-sm uppercase tracking-[0.35em] text-white/45">
               Zar + Satranç
@@ -106,12 +106,12 @@ export default function HomeLobby() {
               Satranç
             </h1>
 
-            <p className="mt-6 max-w-xl text-base leading-7 text-white/70 md:text-lg">
+            <p className="mt-6 hidden max-w-xl text-base leading-7 text-white/70 md:block md:text-lg">
               Klasik satrancın stratejisini, zarın kaosuyla birleştir. Lobi kur,
               kodu paylaş, rakibini içeri al ve oyunu başlat.
             </p>
 
-            <div className="mt-8 flex flex-wrap gap-3 text-sm text-white/60">
+            <div className="mt-8 hidden flex-wrap gap-3 text-sm text-white/60 md:flex">
               <span className="rounded-2xl border border-white/10 bg-white/5 px-4 py-2">
                 Gerçek zamanlı
               </span>
@@ -196,7 +196,7 @@ export default function HomeLobby() {
                   </button>
                 </div>
 
-                <div className="rounded-[20px] bg-black/20 px-4 py-3 text-sm leading-6 text-white/55">
+                <div className="hidden rounded-[20px] bg-black/20 px-4 py-3 text-sm leading-6 text-white/55 md:block">
                   Aynı cihazda test edeceksen gizli pencere açıp ikinci oyuncu
                   gibi katıl.
                 </div>

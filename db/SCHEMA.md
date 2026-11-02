@@ -1,6 +1,6 @@
 # Zarlı Satranç veritabanı şeması
 
-Hedef: PostgreSQL (Supabase). Kaynak: [`migrations/001_init.sql`](migrations/001_init.sql).
+Hedef: PostgreSQL (Supabase). Kaynak: [`migrations/`](migrations/) (001-005, sırayla).
 
 ## Diyagram
 
@@ -34,6 +34,7 @@ erDiagram
         timestamptz last_move_at
         timestamptz created_at
         timestamptz updated_at
+        bigint version
     }
     GAME_PLAYERS {
         uuid id PK
@@ -108,6 +109,7 @@ Lobi ve maç aynı kayıttır. Anlık oyun durumu burada tutulur, sayfa yenileni
 | `last_move_at` | `timestamptz` | evet | | Son hamle veya zar anı |
 | `created_at` | `timestamptz` | hayır | `now()` | Oluşturulma anı |
 | `updated_at` | `timestamptz` | hayır | `now()` | Tetikleyiciyle her güncellemede yenilenir |
+| `version` | `bigint` | hayır | `1` | Her güncellemede 1 artar; istemci eski ve yinelenen mesajları bununla ayıklar |
 
 ### `game_players`
 
@@ -183,6 +185,10 @@ Replay: `game_moves` kayıtlarını `move_number` sırasıyla okumak yeterlidir 
 | `finish_game` | `finishGame` | Pes etmeyle bitirir, rakibi kazanan yapar |
 | `get_player_stats` | `getPlayerStats` | Oyuncunun oynadığı oyun, galibiyet, mağlubiyet ve beraberlik sayıları |
 
+Tekrarlanabilirlik: `record_move`, `save_dice_roll` ve `finish_game` aynı isteğin tekrarını ikinci kez yazmaz, güncel durumu döner. Böylece yanıtı ağda kaybolan istek güvenle yeniden gönderilir. `record_move` tekrarı `duplicate: true` ile bildirir; aynı numaraya farklı bir hamle reddedilir.
+
+`cleanup_stale_lobbies` istemciden çağrılamaz. `pg_cron` onu 10 dakikada bir çalıştırır (`cleanup-stale-lobbies`) ve 30 dakikadan uzun süre `waiting` durumunda kalan lobileri siler.
+
 ## RLS özeti
 
 | Tablo | Okuma | Doğrudan yazma |
@@ -192,6 +198,7 @@ Replay: `game_moves` kayıtlarını `move_number` sırasıyla okumak yeterlidir 
 | `game_dice_rolls` | Yalnızca o oyunun oyuncuları | Yok |
 | `game_moves` | Yalnızca o oyunun oyuncuları | Yok |
 
+- Policy'ler `private.is_game_player` fonksiyonunu kullanır. `private` şeması API'den yayınlanmaz.
 - Yazmalar yalnızca yukarıdaki fonksiyonlardan geçer. "Hamleyi sadece sırası gelen oyuncu ekleyebilir" kuralı `record_move` içinde uygulanır, çünkü hamle ile oyun durumu birlikte değişmelidir. INSERT policy'si tek başına bunu sağlayamazdı.
 - Fonksiyonlar oturum, oyunculuk, oyun durumu, sıra, hamle numarası ve zara uygunluğu oyun satırını kilitleyerek denetler.
 - Anonim oturumlar `authenticated` rolüyle çalışır. `anon` rolünün tablo ve fonksiyon yetkisi yoktur.
@@ -203,4 +210,10 @@ Satranç kuralları ve zar sonucu istemcide (`chess.js`, `Math.random`) üretili
 
 ## Realtime
 
-Hiçbir tablonun `supabase_realtime` publication'ına eklenmesi gerekmez. Kod `postgres_changes` değil, Broadcast kullanıyor (`game-fast-<id>` kanalı, `state_sync` olayı). Bu mesajı alan istemci, oyun `waiting` durumunda değilse durumu veritabanından yeniden okur.
+`supabase_realtime` publication'ında yalnızca `games` tablosu vardır. İstemci `game-fast-<id>` kanalını kullanır:
+
+- `postgres_changes`: `games` satırının güncellemeleri. RLS uygulanır, yalnızca oyuncular alır.
+- Broadcast (`state_sync`): aynı durumu daha hızlı iletir. Kaybolması sorun değildir.
+- Presence: rakibin bağlı olup olmadığını gösterir.
+
+Üç kaynak ve DB okumaları `version` ile birleştirilir; yalnızca daha yeni sürüm uygulanır.
