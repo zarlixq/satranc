@@ -75,6 +75,82 @@ export function isMoveAllowedForRolledPiece(
   );
 }
 
+export type PromotionChoice = "n" | "b" | "r" | "q";
+
+export function moveNeedsPromotion(
+  fen: string,
+  from: Square,
+  to: Square,
+  allowedPieceType: PieceType | null
+): boolean {
+  return new Chess(fen)
+    .moves({ square: from, verbose: true })
+    .some(
+      (move) =>
+        move.to === to && move.piece === allowedPieceType && !!move.promotion
+    );
+}
+
+/** Zar kuralına göre hamleyi uygular; geçersizse hata fırlatır. */
+export function applyChaosMove(params: {
+  fen: string;
+  allowedPieceType: PieceType | null;
+  from: Square;
+  to: Square;
+  promotion?: PromotionChoice;
+}) {
+  const { fen, allowedPieceType, from, to, promotion } = params;
+
+  if (!allowedPieceType) {
+    throw new Error("Bu tur için zar sonucu bulunamadı.");
+  }
+
+  const chess = new Chess(fen);
+
+  if (!isMoveAllowedForRolledPiece(chess, from, to, allowedPieceType)) {
+    throw new Error("Bu hamle gelen taş türüne uygun değil.");
+  }
+
+  const finalPromotion = moveNeedsPromotion(fen, from, to, allowedPieceType)
+    ? promotion ?? "q"
+    : undefined;
+
+  const move = chess.move({
+    from,
+    to,
+    ...(finalPromotion ? { promotion: finalPromotion } : {}),
+  });
+
+  return { chess, move, finalPromotion, fenAfter: chess.fen() };
+}
+
+export type MoveOutcome = "checkmate" | "stalemate" | "draw" | null;
+
+/** Dizilim, sıra, rok ve en passant aynıysa pozisyon aynıdır; hamle sayaçları sayılmaz. */
+function positionKey(fen: string) {
+  return fen.split(" ").slice(0, 4).join(" ");
+}
+
+/** Listenin son pozisyonu toplamda en az üç kez oluştu mu? */
+export function isThreefoldRepetition(fens: string[]): boolean {
+  if (fens.length === 0) return false;
+
+  const last = positionKey(fens[fens.length - 1]);
+  return fens.filter((fen) => positionKey(fen) === last).length >= 3;
+}
+
+/**
+ * priorFens: bu hamleden önce oluşan tüm pozisyonlar (başlangıç dahil).
+ * Tahta FEN'den kurulduğu için chess.js tekrarı kendisi göremez.
+ */
+export function determineOutcome(chess: Chess, priorFens: string[]): MoveOutcome {
+  if (chess.isCheckmate()) return "checkmate";
+  if (chess.isStalemate()) return "stalemate";
+  if (chess.isDraw()) return "draw";
+  if (isThreefoldRepetition([...priorFens, chess.fen()])) return "draw";
+  return null;
+}
+
 function hashString(input: string) {
   let h = 2166136261;
 
