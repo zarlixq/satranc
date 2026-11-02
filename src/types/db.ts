@@ -28,6 +28,8 @@ export type DbGame = {
   last_move_at: string | null;
   created_at: string;
   updated_at: string;
+  /** Her güncellemede artar; eski mesajları ayıklamak için kullanılır. */
+  version: number;
 };
 
 export type DbGamePlayer = {
@@ -90,6 +92,8 @@ export type JoinGameResult = CreateGameResult & {
 export type RecordMoveResult = {
   game: DbGame;
   move: DbGameMove;
+  /** Aynı hamle daha önce yazılmıştı, ikinci kez yazılmadı. */
+  duplicate: boolean;
 };
 
 // Tablolar istemciden salt okunurdur; yazmalar Functions üzerinden yapılır.
