@@ -12,11 +12,106 @@ html,
 body {
   margin: 0;
   padding: 0;
+  overscroll-behavior: none;
 }
 
 body {
-  min-height: 100vh;
+  min-height: 100dvh;
   background: #0a0a0a;
   color: white;
   font-family: Arial, Helvetica, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-text-size-adjust: 100%;
+}
+
+button {
+  cursor: pointer;
+  /* Çift dokunuşta yakınlaştırma ve 300 ms gecikme olmasın. */
+  touch-action: manipulation;
+}
+
+/* Oyun odası: dikey telefonda zar ve durum tahtanın üstünde, kaydırma yok. */
+.room {
+  display: grid;
+  height: 100dvh;
+  width: 100%;
+  overflow: hidden;
+  gap: 6px;
+  background: #161512;
+  padding: max(6px, env(safe-area-inset-top)) max(6px, env(safe-area-inset-right))
+    max(6px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left));
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "top"
+    "dice"
+    "board"
+    "actions";
+}
+
+.room-top {
+  grid-area: top;
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-radius: 12px;
+  background: #201e1b;
+  padding: 4px 12px;
+}
+
+.room-dice {
+  grid-area: dice;
+  border-radius: 12px;
+  background: #201e1b;
+  padding: 6px 12px;
+}
+
+.room-wide-only {
+  display: none;
+}
+
+.room-board {
+  grid-area: board;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  /* Tahta, kalan alanın kısa kenarı kadar olur; kareler hep kare kalır. */
+  container-type: size;
+}
+
+.room-board-inner {
+  position: relative;
+  width: 100cqmin;
+  height: 100cqmin;
+  /* Sürüklerken sayfa kaymasın. */
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.room-actions {
+  grid-area: actions;
+  display: flex;
+  gap: 6px;
+}
+
+/* Geniş ekran ve yatay telefon: yan panel. */
+@media (min-width: 1024px), (orientation: landscape) and (max-height: 600px) {
+  .room {
+    grid-template-columns: minmax(0, 1fr) minmax(240px, 340px);
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "board top"
+      "board dice"
+      "board actions";
+  }
+
+  .room-wide-only {
+    display: flex;
+  }
 }

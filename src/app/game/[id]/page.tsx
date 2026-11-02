@@ -8,7 +8,7 @@ export default async function GamePage({
   const { id } = await params;
 
   return (
-    <main className="h-screen overflow-hidden bg-[#161512] text-white">
+    <main className="h-dvh overflow-hidden bg-[#161512] text-white">
       <GameRoom gameId={id} />
     </main>
   );
