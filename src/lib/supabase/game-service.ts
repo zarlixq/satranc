@@ -1,11 +1,19 @@
 import { Chess, Square } from "chess.js";
-import type { RealtimeChannel } from "@supabase/supabase-js";
+import type { PostgrestError, RealtimeChannel } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabase/client";
 import {
   PieceType,
-  rollAllowedPieceType,
+  getLegalPieceTypes,
   isMoveAllowedForRolledPiece,
 } from "@/lib/chaos-chess";
+
+/*
+ * Veritabanı yazma işlemleri yalnızca SECURITY DEFINER RPC'lerle yapılır
+ * (create_game, join_game, join_game_by_code, save_dice_roll, record_move,
+ * finish_game). Tablolarda istemciye sadece SELECT yetkisi var; RLS de
+ * kullanıcıyı yalnızca oyuncusu olduğu oyunlarla sınırlar. Bu yüzden burada
+ * doğrudan .insert()/.update() KULLANILMAMALI.
+ */
 
 export type GameStatus = "waiting" | "active" | "finished" | "cancelled";
 export type GameColor = "w" | "b";
@@ -33,6 +41,8 @@ export type DbGame = {
   last_move_at: string | null;
   created_at: string;
   updated_at: string;
+  /** Her UPDATE'te trigger ile artar; senkronizasyonda sıralama için kullanılır. */
+  version: number;
 };
 
 export type DbGamePlayer = {
@@ -90,16 +100,12 @@ export type FastStateSyncPayload = {
   game: DbGame;
 };
 
-const DEBUG_GAME_SERVICE = true;
+const DEBUG_GAME_SERVICE = process.env.NODE_ENV !== "production";
 
 function dlog(label: string, data?: unknown) {
   if (!DEBUG_GAME_SERVICE) return;
   const now = new Date().toISOString();
   console.log(`[GAME-SERVICE ${now}] ${label}`, data ?? "");
-}
-
-function getInitialFen() {
-  return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 }
 
 function normalizeLobbyCode(code: string) {
@@ -117,46 +123,22 @@ function generateLobbyCode() {
   return out;
 }
 
-function waitForChannelSubscribed(channel: RealtimeChannel) {
-  dlog("waitForChannelSubscribed:start", { topic: channel.topic });
-
-  return new Promise<void>((resolve, reject) => {
-    let settled = false;
-
-    const finish = (cb: () => void) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      cb();
-    };
-
-    const timeout = setTimeout(() => {
-      dlog("waitForChannelSubscribed:timeout", { topic: channel.topic });
-      finish(() => reject(new Error("Realtime kanalına bağlanılamadı.")));
-    }, 4000);
-
-    channel.subscribe((status) => {
-      dlog("channel:status", { topic: channel.topic, status });
-
-      if (status === "SUBSCRIBED") {
-        finish(() => resolve());
-        return;
-      }
-
-      if (
-        status === "CHANNEL_ERROR" ||
-        status === "TIMED_OUT" ||
-        status === "CLOSED"
-      ) {
-        finish(() =>
-          reject(new Error(`Realtime bağlantı hatası: ${status}`))
-        );
-      }
-    });
-  });
+function pickRandom<T>(items: T[]): T | null {
+  if (items.length === 0) return null;
+  return items[Math.floor(Math.random() * items.length)];
 }
 
-export async function ensureSession(): Promise<string> {
+function rpcError(error: PostgrestError | null, fallback: string): Error {
+  return new Error(error?.message || fallback);
+}
+
+/* ------------------------------------------------------------------ */
+/* Oturum                                                              */
+/* ------------------------------------------------------------------ */
+
+let sessionPromise: Promise<string> | null = null;
+
+async function resolveSession(): Promise<string> {
   const { data: sessionData, error: sessionError } =
     await supabase.auth.getSession();
 
@@ -183,7 +165,6 @@ export async function ensureSession(): Promise<string> {
   const userId = data.user?.id ?? data.session?.user.id;
 
   if (!userId) {
-    dlog("ensureSession:anon:no-user");
     throw new Error("Anon oturum oluşturulamadı.");
   }
 
@@ -191,90 +172,184 @@ export async function ensureSession(): Promise<string> {
   return userId;
 }
 
+/**
+ * Aynı anda gelen çağrılar tek bir anonim kullanıcı üretsin diye paylaşılan
+ * promise kullanılır (aksi halde paralel çağrılar iki ayrı anon kullanıcı
+ * oluşturabilir).
+ */
+export function ensureSession(): Promise<string> {
+  if (!sessionPromise) {
+    sessionPromise = resolveSession().finally(() => {
+      sessionPromise = null;
+    });
+  }
+  return sessionPromise;
+}
+
 export async function getCurrentUserIdOrThrow(): Promise<string> {
   return ensureSession();
 }
 
-export function createFastGameChannel(gameId: string) {
-  const channel = supabase.channel(`game-fast-${gameId}`, {
-    config: {
-      broadcast: {
-        self: false,
-      },
-    },
+/* ------------------------------------------------------------------ */
+/* Realtime                                                            */
+/* ------------------------------------------------------------------ */
+
+type GameChannelEntry = {
+  channel: RealtimeChannel;
+  listeners: Set<(payload: FastStateSyncPayload) => void>;
+  ready: Promise<void>;
+};
+
+/**
+ * Oyun başına TEK kanal. supabase.channel(topic) aynı topic için mevcut kanalı
+ * döndürdüğünden, gönderim için ayrı kanal açıp kapatmak odanın aboneliğini de
+ * kapatıyordu. Kanal artık burada referans sayımıyla yönetiliyor.
+ */
+const gameChannels = new Map<string, GameChannelEntry>();
+
+function gameTopic(gameId: string) {
+  return `game-fast-${gameId}`;
+}
+
+function waitForChannelSubscribed(channel: RealtimeChannel) {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+
+    const finish = (cb: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      cb();
+    };
+
+    const timeout = setTimeout(() => {
+      finish(() => reject(new Error("Realtime kanalına bağlanılamadı.")));
+    }, 8000);
+
+    channel.subscribe((status, err) => {
+      dlog("channel:status", { topic: channel.topic, status, err });
+
+      if (status === "SUBSCRIBED") {
+        finish(() => resolve());
+        return;
+      }
+
+      if (
+        status === "CHANNEL_ERROR" ||
+        status === "TIMED_OUT" ||
+        status === "CLOSED"
+      ) {
+        finish(() => reject(new Error(`Realtime bağlantı hatası: ${status}`)));
+      }
+    });
+  });
+}
+
+function emit(gameId: string, game: DbGame) {
+  const entry = gameChannels.get(gameId);
+  if (!entry) return;
+  const payload: FastStateSyncPayload = { type: "state_sync", game };
+  for (const listener of entry.listeners) listener(payload);
+}
+
+function getOrCreateGameChannel(gameId: string): GameChannelEntry {
+  const existing = gameChannels.get(gameId);
+  if (existing) return existing;
+
+  const channel = supabase.channel(gameTopic(gameId), {
+    config: { broadcast: { self: false } },
   });
 
-  dlog("createFastGameChannel", { gameId, topic: channel.topic });
-  return channel;
+  // 1) Hızlı yol: hamleyi yapan istemcinin yayınladığı durum.
+  channel.on("broadcast", { event: "state_sync" }, ({ payload }) => {
+    const p = payload as FastStateSyncPayload;
+    if (p?.type === "state_sync" && p.game?.id === gameId) emit(gameId, p.game);
+  });
+
+  // 2) Güvenilir yol: veritabanındaki gerçek değişiklik (RLS'e tabi).
+  //    Yayın kaçsa bile (sekme kapandı, ağ koptu) durum buradan gelir.
+  channel.on(
+    "postgres_changes",
+    { event: "UPDATE", schema: "public", table: "games", filter: `id=eq.${gameId}` },
+    ({ new: row }) => emit(gameId, row as DbGame)
+  );
+
+  const entry: GameChannelEntry = {
+    channel,
+    listeners: new Set(),
+    ready: waitForChannelSubscribed(channel),
+  };
+
+  entry.ready.catch(() => {
+    if (gameChannels.get(gameId) === entry) gameChannels.delete(gameId);
+    void supabase.removeChannel(channel);
+  });
+
+  gameChannels.set(gameId, entry);
+  return entry;
 }
 
 export async function subscribeToFastGame(
   gameId: string,
   onStateSync: (payload: FastStateSyncPayload) => void
 ) {
-  const channel = createFastGameChannel(gameId);
-  dlog("subscribeToFastGame:create", { gameId, topic: channel.topic });
+  // postgres_changes RLS kontrolü kullanıcının JWT'si ile yapılır; önce oturum.
+  await ensureSession();
 
-  channel.on("broadcast", { event: "state_sync" }, ({ payload }) => {
-    dlog("subscribeToFastGame:received", payload);
-    onStateSync(payload as FastStateSyncPayload);
-  });
+  const entry = getOrCreateGameChannel(gameId);
+  entry.listeners.add(onStateSync);
 
   try {
-    await waitForChannelSubscribed(channel);
-    dlog("subscribeToFastGame:subscribed", { gameId, topic: channel.topic });
+    await entry.ready;
   } catch (error) {
-    dlog("subscribeToFastGame:error", { gameId, error });
-    await supabase.removeChannel(channel);
+    entry.listeners.delete(onStateSync);
     throw error;
   }
 
   return () => {
-    dlog("subscribeToFastGame:cleanup", { gameId, topic: channel.topic });
-    void supabase.removeChannel(channel);
+    entry.listeners.delete(onStateSync);
+    if (entry.listeners.size === 0 && gameChannels.get(gameId) === entry) {
+      gameChannels.delete(gameId);
+      void supabase.removeChannel(entry.channel);
+    }
   };
 }
 
-export async function broadcastFastStateSync(game: DbGame) {
-  const channel = createFastGameChannel(game.id);
-
-  dlog("broadcastFastStateSync:start", {
-    gameId: game.id,
-    moveCount: game.move_count,
-    fen: game.fen,
-    allowedPieceType: game.allowed_piece_type,
-    currentTurn: game.current_turn,
-    status: game.status,
-  });
+async function broadcastFastStateSync(game: DbGame) {
+  const payload = { type: "state_sync", game } satisfies FastStateSyncPayload;
+  const entry = gameChannels.get(game.id);
 
   try {
-    const response = await channel.send({
-      type: "broadcast",
-      event: "state_sync",
-      payload: {
-        type: "state_sync",
-        game,
-      } satisfies FastStateSyncPayload,
-    });
+    if (entry && entry.channel.state === "joined") {
+      await entry.channel.send({ type: "broadcast", event: "state_sync", payload });
+      return;
+    }
 
-    dlog("broadcastFastStateSync:sent", {
-      gameId: game.id,
-      response,
+    // Abone kanal yoksa (ör. ana menüden katılım) REST ile gönder.
+    if (entry) {
+      await entry.channel.httpSend("state_sync", payload);
+      return;
+    }
+
+    const temp = supabase.channel(gameTopic(game.id), {
+      config: { broadcast: { self: false } },
     });
+    try {
+      await temp.httpSend("state_sync", payload);
+    } finally {
+      void supabase.removeChannel(temp);
+    }
   } catch (error) {
-    dlog("broadcastFastStateSync:error", {
-      gameId: game.id,
-      error,
-    });
-  } finally {
-    setTimeout(() => {
-      dlog("broadcastFastStateSync:cleanup", { gameId: game.id });
-      void supabase.removeChannel(channel);
-    }, 300);
+    // Yayın başarısız olsa bile rakip postgres_changes ile güncellenir.
+    dlog("broadcastFastStateSync:error", { gameId: game.id, error });
   }
 }
 
-export function simulateMoveLocally(params: {
+/* ------------------------------------------------------------------ */
+/* Hamle doğrulama (istemci tarafı)                                    */
+/* ------------------------------------------------------------------ */
+
+function applyRolledMove(params: {
   fen: string;
   allowedPieceType: PieceType | null;
   from: Square;
@@ -282,15 +357,14 @@ export function simulateMoveLocally(params: {
   promotion?: "n" | "b" | "r" | "q";
 }) {
   const { fen, allowedPieceType, from, to, promotion } = params;
-
   const chess = new Chess(fen);
 
   if (!allowedPieceType) {
-    throw new Error("Bu tur için taş sonucu yok.");
+    throw new Error("Bu tur için zar sonucu bulunamadı.");
   }
 
   if (!isMoveAllowedForRolledPiece(chess, from, to, allowedPieceType)) {
-    throw new Error("Bu hamle zar sonucuna uygun değil.");
+    throw new Error("Bu hamle gelen taş türüne uygun değil.");
   }
 
   const candidateMoves = chess
@@ -314,131 +388,45 @@ export function simulateMoveLocally(params: {
     throw new Error("Hamle uygulanamadı.");
   }
 
-  return {
-    fenAfter: chess.fen(),
-  };
+  return { chess, moveResult, finalPromotion };
 }
 
-export async function createLobby(): Promise<CreateLobbyResult> {
-  const userId = await getCurrentUserIdOrThrow();
-  dlog("createLobby:start", { userId });
-
-  let createdGame: DbGame | null = null;
-
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const lobbyCode = generateLobbyCode();
-    dlog("createLobby:attempt", { attempt, lobbyCode });
-
-    const { data, error } = await supabase
-      .from("games")
-      .insert({
-        created_by: userId,
-        lobby_code: lobbyCode,
-        status: "waiting",
-        fen: getInitialFen(),
-        current_turn: "w",
-        allowed_piece_type: null,
-        move_count: 0,
-      })
-      .select()
-      .single();
-
-    if (!error && data) {
-      createdGame = data as DbGame;
-      dlog("createLobby:game-created", createdGame);
-      break;
-    }
-
-    dlog("createLobby:insert-error", error);
-
-    if (error?.code !== "23505") {
-      throw new Error(error?.message || "Lobi oluşturulamadı.");
-    }
-  }
-
-  if (!createdGame) {
-    throw new Error("Lobi kodu üretilemedi. Tekrar dene.");
-  }
-
-  const { data: player, error: playerError } = await supabase
-    .from("game_players")
-    .insert({
-      game_id: createdGame.id,
-      user_id: userId,
-      color: "w",
-      is_host: true,
-    })
-    .select()
-    .single();
-
-  if (playerError || !player) {
-    dlog("createLobby:host-player-error", playerError);
-    throw new Error(playerError?.message || "Host oyuncu eklenemedi.");
-  }
-
-  dlog("createLobby:done", {
-    game: createdGame,
-    player,
-  });
-
-  return {
-    game: createdGame,
-    player: player as DbGamePlayer,
-  };
+export function simulateMoveLocally(params: {
+  fen: string;
+  allowedPieceType: PieceType | null;
+  from: Square;
+  to: Square;
+  promotion?: "n" | "b" | "r" | "q";
+}) {
+  const { chess } = applyRolledMove(params);
+  return { fenAfter: chess.fen() };
 }
+
+/* ------------------------------------------------------------------ */
+/* Okuma                                                               */
+/* ------------------------------------------------------------------ */
 
 export async function getGame(gameId: string): Promise<DbGame> {
-  dlog("getGame:start", { gameId });
-
   const { data, error } = await supabase
     .from("games")
     .select("*")
     .eq("id", gameId)
-    .single();
+    .maybeSingle();
 
-  if (error || !data) {
+  if (error) {
     dlog("getGame:error", { gameId, error });
-    throw new Error(error?.message || "Oyun bulunamadı.");
+    throw new Error(error.message);
   }
 
-  dlog("getGame:done", {
-    gameId,
-    status: data.status,
-    moveCount: data.move_count,
-    currentTurn: data.current_turn,
-    allowedPieceType: data.allowed_piece_type,
-  });
-
-  return data as DbGame;
-}
-
-export async function getGameByCode(code: string): Promise<DbGame> {
-  const normalized = normalizeLobbyCode(code);
-  dlog("getGameByCode:start", { code, normalized });
-
-  const { data, error } = await supabase
-    .from("games")
-    .select("*")
-    .eq("lobby_code", normalized)
-    .single();
-
-  if (error || !data) {
-    dlog("getGameByCode:error", { normalized, error });
-    throw new Error("Bu kodla bir lobi bulunamadı.");
+  if (!data) {
+    // RLS: oyuncusu olmadığın oyun görünmez.
+    throw new Error("Oyun bulunamadı.");
   }
-
-  dlog("getGameByCode:done", {
-    id: data.id,
-    status: data.status,
-    lobbyCode: data.lobby_code,
-  });
 
   return data as DbGame;
 }
 
 export async function getGamePlayers(gameId: string): Promise<DbGamePlayer[]> {
-  dlog("getGamePlayers:start", { gameId });
-
   const { data, error } = await supabase
     .from("game_players")
     .select("*")
@@ -450,12 +438,6 @@ export async function getGamePlayers(gameId: string): Promise<DbGamePlayer[]> {
     throw new Error(error.message);
   }
 
-  dlog("getGamePlayers:done", {
-    gameId,
-    count: data?.length ?? 0,
-    players: data,
-  });
-
   return (data || []) as DbGamePlayer[];
 }
 
@@ -463,7 +445,6 @@ export async function getMyPlayerForGame(
   gameId: string
 ): Promise<DbGamePlayer | null> {
   const userId = await getCurrentUserIdOrThrow();
-  dlog("getMyPlayerForGame:start", { gameId, userId });
 
   const { data, error } = await supabase
     .from("game_players")
@@ -477,126 +458,85 @@ export async function getMyPlayerForGame(
     throw new Error(error.message);
   }
 
-  dlog("getMyPlayerForGame:done", {
-    gameId,
-    userId,
-    player: data ?? null,
-  });
-
   return (data as DbGamePlayer | null) ?? null;
 }
 
-export async function joinGame(gameId: string): Promise<JoinLobbyResult> {
-  const userId = await getCurrentUserIdOrThrow();
-  dlog("joinGame:start", { gameId, userId });
+/* ------------------------------------------------------------------ */
+/* Yazma (RPC)                                                         */
+/* ------------------------------------------------------------------ */
 
-  const existingPlayer = await getMyPlayerForGame(gameId);
-  if (existingPlayer) {
-    dlog("joinGame:existing-player", existingPlayer);
-    const game = await getGame(gameId);
-    return { game, player: existingPlayer };
-  }
+type GamePlayerRpcResult = {
+  game: DbGame;
+  player: DbGamePlayer;
+  activated?: boolean;
+};
 
-  const game = await getGame(gameId);
-  dlog("joinGame:game", {
-    id: game.id,
-    status: game.status,
-    lobbyCode: game.lobby_code,
-  });
+export async function createLobby(): Promise<CreateLobbyResult> {
+  await ensureSession();
 
-  if (game.status !== "waiting") {
-    throw new Error("Bu lobi artık katılıma açık değil.");
-  }
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const lobbyCode = generateLobbyCode();
 
-  const players = await getGamePlayers(gameId);
-  dlog("joinGame:players-before", players);
+    const { data, error } = await supabase.rpc("create_game", {
+      p_lobby_code: lobbyCode,
+    });
 
-  if (players.length >= 2) {
-    throw new Error("Lobi dolu.");
-  }
-
-  const whiteTaken = players.some((p) => p.color === "w");
-  const blackTaken = players.some((p) => p.color === "b");
-
-  let myColor: GameColor | null = null;
-
-  if (!whiteTaken) myColor = "w";
-  else if (!blackTaken) myColor = "b";
-
-  if (!myColor) {
-    throw new Error("Boş renk bulunamadı.");
-  }
-
-  const { data: player, error: playerError } = await supabase
-    .from("game_players")
-    .insert({
-      game_id: gameId,
-      user_id: userId,
-      color: myColor,
-      is_host: false,
-    })
-    .select()
-    .single();
-
-  if (playerError || !player) {
-    dlog("joinGame:player-insert-error", playerError);
-    throw new Error(playerError?.message || "Lobiye katılamadın.");
-  }
-
-  dlog("joinGame:player-inserted", player);
-
-  const updatedPlayersCount = players.length + 1;
-
-  if (updatedPlayersCount === 2) {
-    dlog("joinGame:activating-game", { gameId });
-
-    const { data: updatedGame, error: updateError } = await supabase
-      .from("games")
-      .update({
-        status: "active",
-        started_at: new Date().toISOString(),
-        current_turn: "w",
-        allowed_piece_type: null,
-      })
-      .eq("id", gameId)
-      .select()
-      .single();
-
-    if (updateError || !updatedGame) {
-      dlog("joinGame:activate-error", updateError);
-      throw new Error(updateError?.message || "Oyun başlatılamadı.");
+    if (!error && data) {
+      const result = data as GamePlayerRpcResult;
+      dlog("createLobby:done", result);
+      return { game: result.game, player: result.player };
     }
 
-    dlog("joinGame:game-activated", updatedGame);
+    dlog("createLobby:error", { attempt, lobbyCode, error });
 
-    await broadcastFastStateSync(updatedGame as DbGame);
-
-    return {
-      game: updatedGame as DbGame,
-      player: player as DbGamePlayer,
-    };
+    // 23505: lobi kodu çakıştı -> yeni kodla tekrar dene.
+    if (error?.code !== "23505") {
+      throw rpcError(error, "Lobi oluşturulamadı.");
+    }
   }
 
-  dlog("joinGame:done-waiting", {
-    gameId,
-    updatedPlayersCount,
-    player,
+  throw new Error("Lobi kodu üretilemedi. Tekrar dene.");
+}
+
+async function afterJoin(result: GamePlayerRpcResult): Promise<JoinLobbyResult> {
+  if (result.activated) {
+    await broadcastFastStateSync(result.game);
+  }
+  return { game: result.game, player: result.player };
+}
+
+export async function joinGame(gameId: string): Promise<JoinLobbyResult> {
+  await ensureSession();
+
+  const { data, error } = await supabase.rpc("join_game", {
+    p_game_id: gameId,
   });
 
-  return {
-    game,
-    player: player as DbGamePlayer,
-  };
+  if (error || !data) {
+    dlog("joinGame:error", { gameId, error });
+    throw rpcError(error, "Lobiye katılamadın.");
+  }
+
+  return afterJoin(data as GamePlayerRpcResult);
 }
 
 export async function joinLobbyByCode(code: string): Promise<JoinLobbyResult> {
-  dlog("joinLobbyByCode:start", { code });
-  const game = await getGameByCode(code);
-  return joinGame(game.id);
+  await ensureSession();
+
+  const { data, error } = await supabase.rpc("join_game_by_code", {
+    p_lobby_code: normalizeLobbyCode(code),
+  });
+
+  if (error || !data) {
+    dlog("joinLobbyByCode:error", { code, error });
+    throw rpcError(error, "Lobiye katılamadın.");
+  }
+
+  return afterJoin(data as GamePlayerRpcResult);
 }
 
 export async function rollForCurrentTurn(gameId: string): Promise<DbGame> {
-  dlog("rollForCurrentTurn:start", { gameId });
+  await ensureSession();
 
   const game = await getGame(gameId);
 
@@ -605,274 +545,100 @@ export async function rollForCurrentTurn(gameId: string): Promise<DbGame> {
   }
 
   if (game.allowed_piece_type) {
-    dlog("rollForCurrentTurn:already-rolled", {
-      gameId,
-      allowedPieceType: game.allowed_piece_type,
-    });
     return game;
   }
 
-  const myPlayer = await getMyPlayerForGame(gameId);
-  if (!myPlayer) {
-    throw new Error("Bu oyunun oyuncusu değilsin.");
-  }
-
-  if (game.current_turn !== myPlayer.color) {
-    throw new Error("Sıra sende değil.");
-  }
-
-  dlog("rollForCurrentTurn:context", {
-    gameId,
-    myPlayer,
-    currentTurn: game.current_turn,
-    fen: game.fen,
-  });
-
-  const chess = new Chess(game.fen);
-  const rolled = rollAllowedPieceType(chess);
-
-  dlog("rollForCurrentTurn:rolled", {
-    gameId,
-    rolled,
-    legalMovesCount: chess.moves({ verbose: true }).length,
-  });
+  const legalTypes = getLegalPieceTypes(new Chess(game.fen));
+  const rolled = pickRandom(legalTypes);
 
   if (!rolled) {
     throw new Error("Bu pozisyonda legal taş türü yok.");
   }
 
-  const { data, error } = await supabase
-    .from("games")
-    .update({
-      allowed_piece_type: rolled,
-      last_move_at: new Date().toISOString(),
-    })
-    .eq("id", gameId)
-    .is("allowed_piece_type", null)
-    .select()
-    .single();
+  // Sıra/oyuncu/hamle numarası kontrolleri sunucuda (save_dice_roll) yapılır.
+  const { data, error } = await supabase.rpc("save_dice_roll", {
+    p_game_id: gameId,
+    p_move_number: game.move_count + 1,
+    p_rolled_piece_type: rolled,
+    p_legal_piece_types: legalTypes,
+  });
 
   if (error || !data) {
-    dlog("rollForCurrentTurn:update-error", { gameId, error });
-    throw new Error(error?.message || "Zar atılamadı.");
+    dlog("rollForCurrentTurn:error", { gameId, error });
+    throw rpcError(error, "Zar atılamadı.");
   }
 
-  dlog("rollForCurrentTurn:updated", data);
-
-  await broadcastFastStateSync(data as DbGame);
-
-  return data as DbGame;
+  const updated = data as DbGame;
+  await broadcastFastStateSync(updated);
+  return updated;
 }
 
 export async function makeMove(input: MakeMoveInput): Promise<MakeMoveResult> {
-  const userId = await getCurrentUserIdOrThrow();
+  await ensureSession();
   const { gameId, from, to, promotion } = input;
-
-  dlog("makeMove:start", { gameId, userId, from, to, promotion });
 
   const game = await getGame(gameId);
   if (game.status !== "active") {
     throw new Error("Oyun aktif değil.");
   }
 
-  const myPlayer = await getMyPlayerForGame(gameId);
-  if (!myPlayer) {
-    throw new Error("Bu oyunun oyuncusu değilsin.");
-  }
-
-  if (game.current_turn !== myPlayer.color) {
-    throw new Error("Sıra sende değil.");
-  }
-
-  if (!game.allowed_piece_type) {
-    throw new Error("Bu tur için zar sonucu bulunamadı.");
-  }
-
-  dlog("makeMove:context", {
-    gameId,
-    userId,
-    myPlayer,
-    gameStatus: game.status,
-    currentTurn: game.current_turn,
+  const { chess, moveResult, finalPromotion } = applyRolledMove({
+    fen: game.fen,
     allowedPieceType: game.allowed_piece_type,
-    moveCount: game.move_count,
-    fenBefore: game.fen,
-  });
-
-  const chess = new Chess(game.fen);
-
-  const legalMoves = chess.moves({ square: from, verbose: true });
-  dlog("makeMove:legalMovesFromSquare", {
-    from,
-    legalMoves,
-  });
-
-  if (!isMoveAllowedForRolledPiece(chess, from, to, game.allowed_piece_type)) {
-    throw new Error("Bu hamle gelen taş türüne uygun değil.");
-  }
-
-  const candidateMoves = chess
-    .moves({ square: from, verbose: true })
-    .filter(
-      (move) => move.to === to && move.piece === game.allowed_piece_type
-    );
-
-  if (candidateMoves.length === 0) {
-    throw new Error("Geçersiz hamle.");
-  }
-
-  const needsPromotion = candidateMoves.some((move) => !!move.promotion);
-  const finalPromotion = needsPromotion ? promotion ?? "q" : undefined;
-
-  const moveResult = chess.move({
     from,
     to,
-    ...(finalPromotion ? { promotion: finalPromotion } : {}),
+    promotion,
   });
 
-  if (!moveResult) {
-    throw new Error("Hamle uygulanamadı.");
-  }
+  let resultReason: "checkmate" | "stalemate" | "draw" | null = null;
+  if (chess.isCheckmate()) resultReason = "checkmate";
+  else if (chess.isStalemate()) resultReason = "stalemate";
+  else if (chess.isDraw()) resultReason = "draw";
 
-  const fenAfter = chess.fen();
-  const moveNumber = game.move_count + 1;
+  // Oyun sürüyorsa bir sonraki oyuncunun zarı hamleyle birlikte atomik yazılır.
+  const nextLegalTypes = resultReason ? [] : getLegalPieceTypes(chess);
+  const nextPieceType = resultReason ? null : pickRandom(nextLegalTypes);
 
-  dlog("makeMove:applied-local", {
-    from,
-    to,
-    fenAfter,
-    moveNumber,
-    moveSan: moveResult.san,
-    nextTurn: chess.turn(),
+  const { data, error } = await supabase.rpc("record_move", {
+    p_game_id: gameId,
+    p_move_number: game.move_count + 1,
+    p_piece_type: moveResult.piece,
+    p_from_square: from,
+    p_to_square: to,
+    p_promotion: finalPromotion ?? null,
+    p_san: moveResult.san ?? null,
+    p_uci: `${from}${to}${finalPromotion ?? ""}`,
+    p_fen_after: chess.fen(),
+    p_result_reason: resultReason,
+    p_next_piece_type: nextPieceType,
+    p_next_legal_piece_types: nextPieceType ? nextLegalTypes : null,
   });
 
-  let nextStatus: GameStatus = "active";
-  let nextAllowedPieceType: PieceType | null = null;
-  let winnerUserId: string | null = null;
-  let resultReason: DbGame["result_reason"] = null;
-  let finishedAt: string | null = null;
-
-  if (chess.isCheckmate()) {
-    nextStatus = "finished";
-    winnerUserId = userId;
-    resultReason = "checkmate";
-    finishedAt = new Date().toISOString();
-  } else if (chess.isStalemate()) {
-    nextStatus = "finished";
-    resultReason = "stalemate";
-    finishedAt = new Date().toISOString();
-  } else if (chess.isDraw()) {
-    nextStatus = "finished";
-    resultReason = "draw";
-    finishedAt = new Date().toISOString();
-  } else {
-    nextAllowedPieceType = rollAllowedPieceType(chess);
+  if (error || !data) {
+    dlog("makeMove:error", { gameId, error });
+    throw rpcError(error, "Hamle kaydedilemedi.");
   }
 
-  const { data: updatedGame, error: updateError } = await supabase
-    .from("games")
-    .update({
-      fen: fenAfter,
-      current_turn: chess.turn() as GameColor,
-      allowed_piece_type: nextAllowedPieceType,
-      move_count: moveNumber,
-      last_move_at: new Date().toISOString(),
-      status: nextStatus,
-      winner_user_id: winnerUserId,
-      result_reason: resultReason,
-      finished_at: finishedAt,
-    })
-    .eq("id", gameId)
-    .select()
-    .single();
+  const result = data as { game: DbGame; move: DbGameMove; duplicate: boolean };
+  await broadcastFastStateSync(result.game);
 
-  if (updateError || !updatedGame) {
-    dlog("makeMove:game-update-error", { gameId, updateError });
-    throw new Error(updateError?.message || "Oyun güncellenemedi.");
-  }
-
-  dlog("makeMove:game-updated", updatedGame);
-
-  const { data: insertedMove, error: moveError } = await supabase
-    .from("game_moves")
-    .insert({
-      game_id: gameId,
-      user_id: userId,
-      move_number: moveNumber,
-      color: myPlayer.color,
-      piece_type: moveResult.piece,
-      allowed_piece_type: game.allowed_piece_type,
-      from_square: from,
-      to_square: to,
-      promotion: finalPromotion ?? null,
-      san: moveResult.san ?? null,
-      uci: `${from}${to}${finalPromotion ?? ""}`,
-      fen_before: game.fen,
-      fen_after: fenAfter,
-    })
-    .select()
-    .single();
-
-  if (moveError || !insertedMove) {
-    dlog("makeMove:move-insert-error", { gameId, moveError });
-    throw new Error(moveError?.message || "Hamle kaydı yazılamadı.");
-  }
-
-  dlog("makeMove:move-inserted", insertedMove);
-
-  await broadcastFastStateSync(updatedGame as DbGame);
-
-  dlog("makeMove:done", {
-    gameId,
-    moveCount: updatedGame.move_count,
-    allowedPieceType: updatedGame.allowed_piece_type,
-    status: updatedGame.status,
-  });
-
-  return {
-    game: updatedGame as DbGame,
-    move: insertedMove as DbGameMove,
-  };
+  return { game: result.game, move: result.move };
 }
 
 export async function resignGame(gameId: string): Promise<DbGame> {
-  const userId = await getCurrentUserIdOrThrow();
-  dlog("resignGame:start", { gameId, userId });
+  await ensureSession();
 
-  const game = await getGame(gameId);
-  if (game.status !== "active") {
-    throw new Error("Sadece aktif oyunda pes edebilirsin.");
-  }
-
-  const myPlayer = await getMyPlayerForGame(gameId);
-  if (!myPlayer) {
-    throw new Error("Bu oyunun oyuncusu değilsin.");
-  }
-
-  const players = await getGamePlayers(gameId);
-  const opponent = players.find((p) => p.user_id !== userId);
-
-  const { data, error } = await supabase
-    .from("games")
-    .update({
-      status: "finished",
-      winner_user_id: opponent?.user_id ?? null,
-      result_reason: "resign",
-      finished_at: new Date().toISOString(),
-      allowed_piece_type: null,
-    })
-    .eq("id", gameId)
-    .select()
-    .single();
+  const { data, error } = await supabase.rpc("finish_game", {
+    p_game_id: gameId,
+    p_result_reason: "resign",
+  });
 
   if (error || !data) {
     dlog("resignGame:error", { gameId, error });
-    throw new Error(error?.message || "Pes işlemi başarısız.");
+    throw rpcError(error, "Pes işlemi başarısız.");
   }
 
-  dlog("resignGame:updated", data);
-
-  await broadcastFastStateSync(data as DbGame);
-
-  return data as DbGame;
+  const updated = data as DbGame;
+  await broadcastFastStateSync(updated);
+  return updated;
 }

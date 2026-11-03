@@ -26,6 +26,7 @@ import {
   getGame,
   getGamePlayers,
   getMyPlayerForGame,
+  joinGame,
   makeMove,
   resignGame,
   rollForCurrentTurn,
@@ -50,18 +51,22 @@ function getStatusText(game: DbGame) {
   return `${game.current_turn === "w" ? "Beyaz" : "Siyah"} oynuyor`;
 }
 
-function getResultText(game: DbGame) {
+function getResultText(game: DbGame, myUserId?: string | null) {
   if (game.status !== "finished") return null;
+
+  const iWon = !!myUserId && game.winner_user_id === myUserId;
 
   switch (game.result_reason) {
     case "checkmate":
-      return "Oyun şah mat ile bitti.";
+      if (!myUserId) return "Oyun şah mat ile bitti.";
+      return iWon ? "Şah mat! Kazandın." : "Şah mat oldun.";
     case "stalemate":
       return "Oyun pat ile bitti.";
     case "draw":
       return "Oyun berabere bitti.";
     case "resign":
-      return "Rakip pes etti.";
+      if (!myUserId) return "Oyunculardan biri pes etti.";
+      return iWon ? "Rakip pes etti. Kazandın." : "Pes ettin.";
     case "timeout":
       return "Süre dolduğu için oyun bitti.";
     case "abandon":
@@ -99,6 +104,14 @@ export default function GameRoom({ gameId }: { gameId: string }) {
   const rollSettleTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastRevealKeyRef = useRef("");
 
+  const playersCountRef = useRef(0);
+  const myUserIdRef = useRef<string | null>(null);
+  const gameVersionRef = useRef(0);
+
+  useEffect(() => {
+    gameVersionRef.current = game?.version ?? 0;
+  }, [game]);
+
   const boardAreaRef = useRef<HTMLDivElement | null>(null);
   const [boardSize, setBoardSize] = useState(720);
 
@@ -108,20 +121,34 @@ export default function GameRoom({ gameId }: { gameId: string }) {
 
       await ensureSession();
 
-      const [gameData, playersData, myData] = await Promise.all([
+      // RLS gereği oyun yalnızca oyuncularına görünür. Linkle gelen ve henüz
+      // oyuncu olmayan kullanıcıyı join_game RPC'si ile lobiye al.
+      let myData = await getMyPlayerForGame(gameId);
+      if (!myData) {
+        myData = (await joinGame(gameId)).player;
+      }
+
+      const [gameData, playersData] = await Promise.all([
         getGame(gameId),
         getGamePlayers(gameId),
-        getMyPlayerForGame(gameId),
       ]);
 
-      setGame(gameData);
+      // Sunucudan gelen durum, realtime ile daha önce gelmiş daha yeni bir
+      // durumu ezmesin.
+      setGame((prev) =>
+        prev && prev.id === gameData.id && prev.version > gameData.version
+          ? prev
+          : gameData
+      );
       setPlayers(playersData);
+      playersCountRef.current = playersData.length;
       setMyPlayer(myData);
+      myUserIdRef.current = myData.user_id;
 
       if (gameData.status === "waiting") {
         setMessage("Rakip lobiye girene kadar bekleniyor.");
       } else if (gameData.status === "finished") {
-        setMessage(getResultText(gameData) ?? "Oyun bitti.");
+        setMessage(getResultText(gameData, myData.user_id) ?? "Oyun bitti.");
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Oyun yüklenemedi.";
@@ -146,22 +173,26 @@ export default function GameRoom({ gameId }: { gameId: string }) {
           if (payload.type !== "state_sync") return;
           if (payload.game.id !== gameId) return;
 
-          setGame((prev) => {
-            if (!prev) return payload.game;
+          // version her UPDATE'te artar: yalnızca daha yeni durumu kabul et.
+          // Aynı değişiklik hem broadcast hem postgres_changes ile gelir;
+          // yinelenen/eski olay oyuncunun seçimini vb. sıfırlamamalı.
+          if (payload.game.version <= gameVersionRef.current) return;
+          gameVersionRef.current = payload.game.version;
 
-            const sameOrNewer =
-              payload.game.move_count >= prev.move_count ||
-              payload.game.status !== prev.status ||
-              payload.game.allowed_piece_type !== prev.allowed_piece_type ||
-              payload.game.fen !== prev.fen;
-
-            return sameOrNewer ? payload.game : prev;
-          });
-
+          setGame((prev) =>
+            prev && prev.version >= payload.game.version ? prev : payload.game
+          );
           setOptimisticFen(null);
           setSelectedSquare(null);
 
-          if (payload.game.status !== "waiting") {
+          if (payload.game.status === "finished") {
+            setMessage(
+              getResultText(payload.game, myUserIdRef.current) ?? "Oyun bitti."
+            );
+          }
+
+          // Oyuncu listesi yalnızca katılımda değişir.
+          if (playersCountRef.current < 2 && payload.game.status !== "waiting") {
             void loadAll();
           }
         });
@@ -356,7 +387,7 @@ export default function GameRoom({ gameId }: { gameId: string }) {
     !isRolling;
 
   const statusText = game ? getStatusText(game) : "Yükleniyor";
-  const resultText = game ? getResultText(game) : null;
+  const resultText = game ? getResultText(game, myPlayer?.user_id) : null;
 
   const opponentPlayer = useMemo(() => {
     if (!myPlayer) return null;
@@ -381,7 +412,7 @@ export default function GameRoom({ gameId }: { gameId: string }) {
         setOptimisticFen(null);
 
         if (result.game.status === "finished") {
-          setMessage(getResultText(result.game) ?? "Oyun bitti.");
+          setMessage(getResultText(result.game, result.move.user_id) ?? "Oyun bitti.");
         } else {
           setMessage("Zar dönüyor...");
         }
@@ -829,7 +860,11 @@ export default function GameRoom({ gameId }: { gameId: string }) {
                 : isRolling
                 ? "Legal taş türleri arasında zar dönüyor..."
                 : displayedPieceType
-                ? `Sadece ${PIECE_LABELS[displayedPieceType]} ile hamle yapabilirsin.`
+                ? isMyTurn
+                  ? `Sadece ${PIECE_LABELS[displayedPieceType]} ile hamle yapabilirsin.`
+                  : `Rakip ${PIECE_LABELS[displayedPieceType]} ile oynayacak.`
+                : !isMyTurn
+                ? "Sıra rakipte."
                 : "Hamle bilgisi bekleniyor."}
             </div>
           </div>
